@@ -154,7 +154,8 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `book.rs` | 699 | D | Who owns which card memory (`VICTORY_BOOK`) |
 | `timeline.rs` + `timeline/{hooks,record,report}.rs` | 51+304+621+914 | C/D | `span()` (no-op without diagnostics), Chrome trace (`VICTORY_TIMELINE`) |
 | `shadow.rs` | 5307 | M | Host copies of title buffers |
-| `watch.rs` | 4168 | M | Write watching / guards |
+| `watch.rs` | 4604 | M | Write watching / guards |
+| `writers.rs` | 2215 | M | The writers watch: which code writes a range of title memory, and what (`VICTORY_WRITERS*`, read in diagnostics builds; [memory doc §3.4a](victory-gpu-memory.md)) |
 | `resource.rs` | 4390 | M | Heaps, resources, host textures (`HostTexture`, `host_transition`) |
 | `texture.rs`, `texture/ahead.rs` | 2205+445 | M | Texture detiling and uploads, copy queue |
 | `tiles.rs` | 1516 | M | Levels on demand |
@@ -166,7 +167,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `picked.rs` | 360 | M | `VICTORY_PICKED_WRITES` |
 | `inplace.rs` | 1387 | M | Title memory opened as host heaps |
 | `safecopy.rs` | 699 | M | Fault-tolerant copies |
-| `titlewrite.rs`, `titlewrite/decode.rs` | 386+670 | M | Stores done in the title's place |
+| `titlewrite.rs`, `titlewrite/decode.rs` | 425+697 | M | Stores done in the title's place; `store_extent` gives the writers watch a store's size |
 | `land.rs`, `land/tests.rs` | 655+457 | M | Landing threads |
 | `replay/**` | ~12k | M/D | Frame record and replay (`docs/replay.md`) |
 | `build.rs` | 42 | C | Translator fingerprint |
@@ -433,15 +434,22 @@ interval (default 1/60 s). Origin waits hand out frame tokens. The host
   `library::name(kind, root blob, code, g.describe())`.
 - **When it is made**: `make::early` at creation if an earlier run drew with it
   (`library::wanted_early`) or it is a known scene input. Otherwise at first
-  draw, by `make::ready` (`pipeline/make.rs:223`): it queues as `REQUESTED`
+  draw, by `make::ready` (`pipeline/make.rs:229`): it queues as `REQUESTED`
   and waits within a **per-frame budget shared by all threads**
   (`VICTORY_PIPELINE_WAIT_MS`, 500; screen passes `VICTORY_SCREEN_WAIT_MS`,
   10 000). Past the budget the **draw is dropped** (counted in
-  `draw::DROPPED`).
+  `draw::DROPPED`). Diagnostics builds name each pipeline the first time a
+  draw or dispatch of it is dropped while it is being made (`dropped: its
+  host pipeline is being made (first drop of this pipeline)`); a pipeline
+  left out on purpose (`make.rs` `left_out`) is counted under its own
+  reason, not as being made.
 - **Worker queues**: screen (2 dedicated workers), requested, early, slow
   (≤¼ of the workers at once).
-- **The BVH builder** pipelines (`pipeline.rs:262-370`) only run with
-  `VICTORY_BVH_BUILDER=1` (`-RayTracing`).
+- **The BVH builder** pipelines (`pipeline.rs:244-381`) run unless
+  `VICTORY_BVH_BUILDER=0` (`-NoRayTracing`; off by default until
+  2026-11-26, when launches without it were found posterised two times in
+  three). With it off the ray-resolve and ray-activation programs are left
+  out too (`pipeline/make.rs` `left_out`).
 
 ---
 
@@ -604,7 +612,7 @@ switches that only work in diagnostics builds.
 | `VICTORY_PC_DXC` | `pipeline/host.rs:1088` | Path of `dxc.exe` (tests) |
 | `VICTORY_SKIP_PIPELINES` **D** | `pipeline.rs:498` | Comma-separated 16-hex shader hashes whose pipelines are skipped |
 | `VICTORY_SHADER_SAVE` | `pipeline.rs:154` | Folder: dump containers + translations |
-| `VICTORY_BVH_BUILDER` / `VICTORY_BVH_QUARANTINE` / `VICTORY_ACTIVATE_RAYS` / `VICTORY_RT_RESOLVE` | `pipeline.rs:333`, `307`; `pipeline/make.rs:62-79`, `68` | Ray-tracing gating |
+| `VICTORY_BVH_BUILDER` / `VICTORY_BVH_QUARANTINE` / `VICTORY_ACTIVATE_RAYS` / `VICTORY_RT_RESOLVE` | `pipeline.rs:341` (`builder_asked`, on unless `0`), `312`; `pipeline/make.rs:62-80`, `70` | Ray-tracing gating |
 | `VICTORY_PIPELINE_SLOW`, `_LOWEST`, `_WAIT_SHARED` | `pipeline/make.rs:355`, `508`, `272` | Worker policy |
 | `VICTORY_EARLY_ALL`, `VICTORY_LIBRARY_MAP/_HANDLE/_LOCK/_TRIM` | `pipeline/library.rs:768`, `86`, `95`, `432`, `375` | Pipeline library |
 | `VICTORY_PIPELINE_BOOK` | `pipeline/known.rs:43` | Record every pipeline for `victory warm` |

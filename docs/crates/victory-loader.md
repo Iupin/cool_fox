@@ -57,6 +57,8 @@ ImportResolver::resolve(&self, dll /* as written */, &ImportSymbol) -> Resolutio
 UnimplementedPolicy::{Trap (default), ReturnZero}; unimplemented_call_count()
 report_crashes(); log_crashes_to(path); log_crash(text); report_unhandled(info);
 note_title_output(line); locate(addr) -> "module+0xrva"
+unwind_here(&CONTEXT, &mut [u64]) -> usize   (the current thread's frames, no allocation;
+                                              the GPU side's writers watch takes it)
 disable_thread_calls(base) -> Option<bool>
 write_sites::{apply, apply_asked}
 diagnostics: dump_stacks, dump_stacks_on_schedule, profile_on_schedule(phase), save_on_crash

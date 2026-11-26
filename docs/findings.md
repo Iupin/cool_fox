@@ -150,3 +150,30 @@ What changed (`crates/victory-gpu/src/shadow.rs`, `card_limits_from`, `card_admi
   limits.
 
 Not measured in the game yet; a unit test replays the order of the session above.
+
+## 2026-11-26: posterised launches came from running without ray tracing
+
+The title's last composite pass (`PS_CompositeNMB`) came out posterised in
+about two launches in three, for the whole session: each colour channel on
+a ladder of levels about 1.26 apart. Unattended launches graded by the
+roughness of the presented frame's histograms (`docs/bug-journal.md`,
+2026-11-26, has the method), good of graded:
+
+| configuration | good | bad |
+|---|---|---|
+| builder off, stock launcher | 3 | 5 |
+| builder off, none of the 19 launcher switches | 2 | 5 |
+| builder off, without `THIN`/`JOIN_PARTS` | 1 | 5 |
+| builder off, other diagnostics (watches, constant capture, writers watch, a forced settings listener, a pipeline wait) | 9 | 17 |
+| **builder off, all** | **15** | **32** |
+| builder off, ray-resolve and ray-activation programs kept | 2 | 0 |
+| `VICTORY_BVH_BUILDER=1` | 7 | 0 (one more crashed before grading) |
+| ray tracing on by default (stock launcher) | 2 | 0 |
+
+At 32 % good, 9 good in a row has a chance of about 3 in 100,000. Change:
+ray tracing is on unless `VICTORY_BVH_BUILDER=0` (`pipeline::builder_asked`),
+so the builder's stages run and the resolve and activation programs are no
+longer left out. Accepted on this evidence without a further proof batch.
+The mechanism is not shown (inferred: what the left-out programs write each
+frame is never written and holds whatever that memory held at the start).
+Measured on the RTX 3080 10 GB machine (Ryzen 9 5900X, 32 GB, release build, stock launcher) in the prologue's opening scene: 100 to 108 ms a frame (9 to 10 fps) with ray tracing on, of which some 66 ms is preparing on the CPU and 14 to 17 ms on the card, against 67 to 70 ms (14 to 15 fps) with it off: about a third of the frame rate. The card held about 8.5 GB of a 9.0 GB budget and the process about 20 GB. In the playable open world the frame rate was 8 to 12 fps as seen in play (not taken from the log). Long sessions were not measured; one launch ended with the PC's memory 98 % in use.

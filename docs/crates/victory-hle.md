@@ -18,7 +18,7 @@ starts).
 | deps | `victory-gpu` (D3D12.X device, title-memory tracking, console model, timeline), `victory-loader` (resolver trait, crash log, thread notices), `victory-pe` (`ImportSymbol`), `victory-formats` (XMA, BCPack, texture layouts), `opus-pure`, `zlib-rs`, `tracing`, `windows-sys` |
 | optional | `windows`, `windows-core`: only for `diagnostics` (`modules/audio/capture.rs`, WASAPI loopback recorder) |
 | feature `diagnostics` | enables `victory-gpu/diagnostics`, `victory-loader/diagnostics`, the audio recorder, `VICTORY_KEYS`, `VICTORY_XMA_DUMP`, per-call-site logging in `QueryApiImpl`, timeline wrapping of host imports, re-exports `frame_phase`, `replay` |
-| platform | `lib.rs`, registry, `runtime`, most COM-area modules compile anywhere; `apu, dstorage, files, lifecycle, media, net, xmem` are `cfg(windows)` (`modules/mod.rs:11-41`), and `modules::all` only registers them on Windows. |
+| platform | `lib.rs`, registry, `runtime`, most COM-area modules compile anywhere; `apu, dstorage, files, lifecycle, media, net, reads, xmem` are `cfg(windows)` (`modules/mod.rs:11-41`), and `modules::all` only registers them on Windows. |
 
 ## Public API used by other crates
 
@@ -33,6 +33,7 @@ starts).
 | `modules::d3d12x::{use_shader_cache, precompile, warm_shader}` | run, translate, warm | `d3d12x.rs` |
 | `modules::audio::capture::{start, child}` | main.rs, run.rs diagnostics | recorder child process |
 | re-exports `console` (from `victory-gpu`), `known_pipelines`, `frame_phase`, `replay` | app | |
+| `watch_writers()` (diagnostics) | run.rs diagnostics | starts the GPU side's writers watch (`VICTORY_WRITERS*`, `docs/crates/victory-gpu-memory.md` §3.4a) with the loader's `locate` and `unwind_here`; the CRT `exit`, `TerminateProcess` of the title's own process (`kernel.rs`) and the suspend's end (`lifecycle.rs` `end`) call `victory_gpu::writers_at_exit` for its last table |
 
 ## Module map
 
@@ -45,7 +46,8 @@ starts).
 | `image_watch.rs` | diagnostics-style switch `VICTORY_IMAGE_WATCH`: logs named words of the title image once a second. |
 | `modules/mod.rs` | Module list; `all()` builds the registry in a fixed order. |
 | `modules/kernel.rs` | Module/library APIs (pseudo handles, title DLLs, `GetProcAddress` overrides), debug output, CRT exit paths, unhandled filter chaining, argv, thread priorities. |
-| `modules/files.rs` | Virtual drives (`mount`, `mount_at`, `translate`) and every path-taking kernel32/CRT/msvcp import; `ReadFile`/`fread` into guarded title memory; `host!` macro. |
+| `modules/files.rs` | Virtual drives (`mount`, `mount_at`, `translate`) and every path-taking kernel32/CRT/msvcp import; the kernel reads into title memory (`ReadFile`, `fread`, `_read`) and `setvbuf`; `host!` macro. |
+| `modules/reads.rs` | What the title reads, said aloud: names of handles/streams/descriptors (`GetFinalPathNameByHandleW`), rate-limited warnings (`tell`), how a destination is guarded (`guarded`), per-file lines for the first minute (`note`, `note_named`). |
 | `modules/xmem.rs` | `xmem.dll` and `VirtualFree`: console virtual memory, allocation hooks, physical pages as pagefile sections, aliasing for the GPU, working-set stats. |
 | `modules/d3d12x.rs` | `d3d12_xs.dll`: hands device creation, virtual-memory config and root signatures to `victory-gpu`; shader/pipeline cache dirs; host GPU failure → crash log + exit. |
 | `modules/xg.rs` | `xg_xs.dll` texture-layout computer from `victory_formats::texture`. |
@@ -194,7 +196,7 @@ Legend: **impl** = implemented for what titles were seen to call; **partial**;
 | Module | DLL / API area | Exports or areas | State |
 |--------|----------------|------------------|-------|
 | kernel | kernel32, kernelbase, `api-ms-win-core-{libraryloader,processthreads,debug,errorhandling}-*`, `api-ms-win-crt-runtime-*` | 22: `GetModuleHandle*`, `GetModuleFileName*`, `LoadLibrary*`, `GetProcAddress`, `FreeLibrary`, `DisableThreadLibraryCalls`, `OutputDebugString*`, `exit`, `abort`, `terminate`, `_invalid_parameter_noinfo_noreturn`, `TerminateProcess`, `SetUnhandledExceptionFilter`, `SetThreadPriority`, `__p___argc/argv` | impl (overrides; rest passes to host) |
-| files | kernel32/kernelbase, `api-ms-win-core-{file,processenvironment}-*`, ucrtbase, `api-ms-win-crt-{stdio,filesystem,time}-*`, msvcp140 | 33 path functions (`CreateFile{W,A,2}`, `Delete*`, `*Directory*`, `*FileAttributes*`, `GetDiskFreeSpace*`, `FindFirstFile*`, `MoveFileExW`, `SetCurrentDirectoryA`, `fopen*`, `_wfopen*`, `_open/_wopen`, `_wstat64`, `_stat64i32`, `remove`, `_wchmod`, `_wutime64`, `std::_Fiopen` x2) + `ReadFile`, `fread` | impl |
+| files | kernel32/kernelbase, `api-ms-win-core-{file,processenvironment}-*`, ucrtbase, `api-ms-win-crt-{stdio,filesystem,time}-*`, msvcp140 | 33 path functions (`CreateFile{W,A,2}`, `Delete*`, `*Directory*`, `*FileAttributes*`, `GetDiskFreeSpace*`, `FindFirstFile*`, `MoveFileExW`, `SetCurrentDirectoryA`, `fopen*`, `_wfopen*`, `_open/_wopen`, `_wstat64`, `_stat64i32`, `remove`, `_wchmod`, `_wutime64`, `std::_Fiopen` x2) + `ReadFile`, `fread`, `_read`, `setvbuf` | impl |
 | xmem | xmem.dll, kernel32/kernelbase, `api-ms-win-core-memory-*` | 14: `XMem{Alloc,Free}{,Default}`, `XMemVirtualAlloc/Query`, `XMem{Allocate,Free,Map}PhysicalPages`, `...Scatter`, `XMemGetWorkingSetStatistics`, `XMemTransferMemory`, `XMemIsToolsMemAvailable` (0), `VirtualFree` | impl, with `shortcut:`s |
 | d3d12x | d3d12_xs.dll | 6: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12Serialize{,Versioned}RootSignature`, `D3D12CreateRootSignatureDeserializer`, data `IID_ID3D12Device` | forwards to victory-gpu |
 | xg | xg_xs.dll | `XGCreateTextureComputer`, `XGSuggestSwizzleMode`; computer slots 0x08/0x10/0x40/0x48/0x50 | partial (other slots log + fail) |
@@ -243,7 +245,9 @@ Legend: **impl** = implemented for what titles were seen to call; **partial**;
   Completions are bound to the `Call`, not the block, so a late completion
   cannot end a newer call on the same block. Helpers for area authors:
   `finished(block, identity, hr)`, `finished_with(block, identity, Ok(bytes))`
-  (synchronous results), `pending_with` (result computed on our thread, e.g.
+  (synchronous results: the call completes inside its begin, so on a
+  thread-pool completion port the title's routine can run before the
+  title's `*Async` call has returned; logged, see "Diagnose"), `pending_with` (result computed on our thread, e.g.
   dialogs), `result::<T>` to fetch, `bytes(value)`.
 - **Our own threads**: dstorage workers (one per logical CPU, named
   `dstorage N`), XMA decoder (`victory XMA decoder`, parks 2 ms), gameinput
@@ -279,9 +283,41 @@ letters (`G:`, `T:`) hide a host drive of the same letter from the title;
 through `host!("kernel32.dll", "CreateFileW": fn-type)` (`files.rs:26`), a
 `OnceLock`-cached `host::function` lookup that panics if the host lacks it.
 `dstorage::open_file` and `media`'s resolver go through `files` too.
-`ReadFile`/`fread` are bound here for a different reason: they open guarded
-title memory first (`victory_gpu::kernel_writing`), because kernel writes into
-a read-only-guarded page fail instead of faulting into the guard handler.
+`ReadFile`, `fread` and `_read` are bound here for a different reason: they
+open guarded title memory first (`victory_gpu::kernel_writing`), because
+kernel writes into a read-only-guarded page fail (`ERROR_NOACCESS` /
+`ERROR_INVALID_USER_BUFFER`) instead of faulting into the guard handler.
+
+### Kernel reads into title memory
+
+Every way the host kernel writes title memory, and what guards it
+(2026-11-26 review of the title's and its DLLs' imports):
+
+| Path | How | Safe? |
+|------|-----|-------|
+| `ReadFile` (title, Bink, libHttpClient) | ours: destination opened for the call; a read refused for its buffer (`ERROR_NOACCESS`, `ERROR_INVALID_USER_BUFFER`) on a disk file is tried again up to 8 times (about 0.25 s), from its OVERLAPPED offset or with the file pointer put back; a read left pending (`ERROR_IO_PENDING`) keeps its destination open for 2 s more (`KernelWrite::keep_for`), so no refresh takes it for clean before the bytes land | yes |
+| `fread` | ours: destination opened for the call (the CRT reads large requests straight into it); failures warned, not retried (the stream position is the CRT's) | yes |
+| `_read` (libHttpClient) | ours, as `fread` | yes |
+| stream refills (`fgetc`, small `fread`, `std::basic_filebuf` through `_get_stream_buffer_pointers`) | into the CRT's own buffer; `setvbuf` with a title buffer is given none, so the CRT makes its own | yes |
+| `std::basic_istream::read` (host msvcp140) | calls the title's own `basic_filebuf::xsgetn`, which calls the title's `fread` import (ours) | yes |
+| kernelbase out parameters (`GetFileSizeEx`, `GetFileAttributesExW`, `FindFirstFileW`, `QueryPerformance*`, the read count of `ReadFile`) | the kernel writes a local of kernelbase, copied out in user mode, where a guard faults into the handler | yes |
+| an overlapped read's OVERLAPPED status words | written by the kernel at completion; the title's OVERLAPPED is not a GPU buffer | not guarded, not seen to matter |
+| DirectStorage, memory destination | `kernel_writing` for the request, failed reads retried 8 times, then `kernel_will_write` | yes |
+| DirectStorage, page destination | our own section view (`write_physical`/`page_window`), then `pages_written` | yes (user mode) |
+| XGameSave reads (`read_blobs`, `read_result`), xasync results | copied in user mode | yes |
+
+Said aloud for the next run (`reads.rs`): every failed or unexplained short
+read is a warning, rate-limited (first 16, then every power of two):
+`ReadFile: a read of the title's failed`, `ReadFile: the host refused the
+title's buffer; opened again and tried again`, `ReadFile: fewer bytes than
+asked, short of the file's end`, `fread: a read of the title's failed`,
+`_read: a read of the title's failed`, with the host path, destination,
+sizes, error and `guarded="R of B blocks read-only by the GPU side's guard,
+A also shown and guarded at another view"`. For the first minute,
+`title file: first read` once per file (path, api, size, first request),
+then `title files read in the first minute` and one `title file: read in the
+first minute` per file (reads, bytes asked and got, failures), sorted by
+path, for diffing a good and a bad launch.
 
 ## Save data and title storage
 
@@ -457,9 +493,6 @@ refcounts).
   loader, XAudio2 passes through to the host.
 - `xmem.rs` comments cite "Decision 0001" / "decision 0007"; no decisions
   directory exists in `docs/`.
-- `fread`'s doc comment (`files.rs`) says bytes are "read beside, a chunk at
-  a time"; the body only wraps the host `fread` in `kernel_writing`. Any
-  read-beside logic must be in victory-gpu (not verified).
 - `missing::<SLOT>` returns an HRESULT even for slots whose real return type
   is `bool` or a value.
 - `xasync::Pool` grows without bound.
@@ -499,7 +532,14 @@ loader then never looks for it in the title folder (`run.rs:286`).
 passed). Overriding single functions of it still works (HLE wins).
 
 **Diagnose**: `VICTORY_LOG=victory_hle=debug,info`; `title` target logs the
-title's `OutputDebugString`. Unknown DLL names refused by `LoadLibrary` log
+title's `OutputDebugString`. At info: the title's file reads of the first
+minute and every failed one (`reads.rs`, above), `game save: provider
+opened`, `game save: containers reported`, `game save: blob read` (or a
+warning when a read fails or its buffer is too small), `dstorage: a request
+completed with less data than its destination holds` (warning), and
+`async: a completion routine runs before the call that began it returned`
+(`xasync::early_completion`: our areas complete in their begin; the line
+names the area's call site and whether it ran inline). Unknown DLL names refused by `LoadLibrary` log
 `a host DLL outside the host policy: refused`; pseudo-module misses log
 `GetProcAddress: not implemented`.
 
@@ -508,9 +548,9 @@ title's `OutputDebugString`. Unknown DLL names refused by `LoadLibrary` log
 `cargo test -p victory-hle` (most need Windows; some spawn child processes or
 touch the real filesystem via `tempfile`). Approximate unit test counts:
 `dstorage` 19 (one `#[ignore]` benchmark needing `VICTORY_BENCH_FILE`),
-`xmem` 17 (one ignored benchmark), `xasync` 12, `xgamesave` 11 (crash at every
+`xmem` 17 (one ignored benchmark), `xasync` 13, `xgamesave` 11 (crash at every
 step in child processes), `lifecycle` 10, `audio` 8, `gameinput` 8 (fake
-`Source`), `files` 7, `kernel` 6, `lib.rs` 5, `media` 5, `rpcrt4` 5, `xg` 4,
+`Source`), `files` 11, `kernel` 6, `reads` 3, `lib.rs` 5, `media` 5, `rpcrt4` 5, `xg` 4,
 `xsystem` 4, others 1-3. Integration: `tests/no_dll_planting.rs`. The
 `tests/fixtures/hle-probe` stand-in title is used by **victory-loader**'s
 `tests/load_probe.rs` with a fake resolver, not by this crate's tests. No game

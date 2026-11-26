@@ -658,13 +658,45 @@ pub(crate) struct Aligned16(pub(crate) CONTEXT);
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
 pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+    walk(context, low, high, |pc| {
+        frames.push(pc);
+        frames.len() < MAX_FRAMES
+    });
+}
+
+/// The return addresses of the thread whose `context` this is, the current
+/// one (a vectored handler's faulting thread, or a context the caller took
+/// of itself), into `out`, from the instruction up; how many were written.
+/// Allocates nothing and takes no lock of ours, so it may be called from a
+/// vectored exception handler (`victory_gpu`'s writers watch).
+pub fn unwind_here(context: &CONTEXT, out: &mut [u64]) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    let (mut low, mut high) = (0, 0);
+    // SAFETY: writes the current thread's stack bounds.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let mut n = 0;
+    walk(*context, low, high, |pc| {
+        out[n] = pc;
+        n += 1;
+        n < out.len()
+    });
+    n
+}
+
+/// Calls `push` with each frame's instruction address, from `context`'s up,
+/// while it returns true (the stack being `low..high`).
+fn walk(context: CONTEXT, low: usize, high: usize, mut push: impl FnMut(u64) -> bool) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
-    frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
+    if !push(context.Rip) {
+        return;
+    }
+    loop {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
         if rsp < low || rsp + 8 > high {
@@ -693,10 +725,9 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 {
+        if context.Rip == 0 || !push(context.Rip) {
             break;
         }
-        frames.push(context.Rip);
     }
 }
 
@@ -838,6 +869,24 @@ mod tests {
                 .collect();
             assert_eq!(ours.as_slice(), &walked[1..]);
         }
+    }
+
+    /// [`unwind_here`] gives the same frames as [`unwind`] into a slice, and
+    /// no more than the slice holds.
+    #[test]
+    fn unwinds_into_a_slice() {
+        // SAFETY: a zeroed CONTEXT is valid; captured 16-byte aligned.
+        let context = unsafe {
+            let mut context = Aligned16(std::mem::zeroed());
+            RtlCaptureContext(&mut context.0);
+            context.0
+        };
+        let all = unwind(context);
+        let mut out = [0u64; 3];
+        let n = unwind_here(&context, &mut out);
+        assert_eq!(n, 3.min(all.len()));
+        assert_eq!(out[..n], all[..n]);
+        assert_eq!(unwind_here(&context, &mut []), 0);
     }
 
     /// The frames of this call, both ways: our [`unwind`], and the system's

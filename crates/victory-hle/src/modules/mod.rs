@@ -26,6 +26,8 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+#[cfg(windows)]
+pub(crate) mod reads;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;

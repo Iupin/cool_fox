@@ -16,11 +16,13 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
+use super::reads;
 use crate::{HleExport, HleModule, hle_export};
 
 /// The host's own function: what the import would have been bound to.
@@ -48,6 +50,7 @@ fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
+    reads::start();
     let wide = root_wide(root);
     let mut drives = drives();
     if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
@@ -67,6 +70,7 @@ pub fn mount(root: &Path) -> Option<char> {
 /// open their package as `G:\..` and temporary files as `T:\..`). A host
 /// drive of that letter is hidden from the title.
 pub fn mount_at(letter: char, root: &Path) {
+    reads::start();
     let letter = letter.to_ascii_uppercase();
     let Some(index) = u32::from(letter)
         .checked_sub(u32::from('A'))
@@ -270,14 +274,16 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
-        p.ptr(),
-        access,
-        share,
-        security,
-        disposition,
-        flags,
-        template,
+    handle_opened(
+        host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            p.ptr(),
+            access,
+            share,
+            security,
+            disposition,
+            flags,
+            template,
+        )
     )
 }
 
@@ -290,30 +296,32 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
-        Some(p) => {
-            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
-                p.as_ptr(),
-                access,
-                share,
-                security,
-                disposition,
-                flags,
-                template,
-            )
+    handle_opened(
+        match narrow(path) {
+            Some(p) => {
+                host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+                    p.as_ptr(),
+                    access,
+                    share,
+                    security,
+                    disposition,
+                    flags,
+                    template,
+                )
+            }
+            None => {
+                host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+                    path,
+                    access,
+                    share,
+                    security,
+                    disposition,
+                    flags,
+                    template,
+                )
+            }
         }
-        None => {
-            host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
-                path,
-                access,
-                share,
-                security,
-                disposition,
-                flags,
-                template,
-            )
-        }
-    }
+    )
 }
 
 /// Used by Bink.
@@ -325,12 +333,14 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
-        p.ptr(),
-        access,
-        share,
-        disposition,
-        params,
+    handle_opened(
+        host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+            p.ptr(),
+            access,
+            share,
+            disposition,
+            params,
+        )
     )
 }
 
@@ -500,7 +510,9 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    stream_opened(
+        host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    )
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
@@ -514,10 +526,12 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
-        p.ptr(),
-        mode,
-        share,
+    stream_opened(
+        host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+            p.ptr(),
+            mode,
+            share,
+        )
     )
 }
 
@@ -526,7 +540,25 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first, and not guarded again before the call is done.
+// is opened first, and not guarded again before the call is done (or, for
+// a read that goes on after the call, for `PENDING_KEEP` more). A read the
+// host still refuses for the buffer is tried again; every failure and every
+// short read the file's end does not explain is a warning (`reads`).
+
+/// How long the destination of a read that goes on after its call stays
+/// open: the kernel completes it in that time or the title waits for it.
+const PENDING_KEEP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a read refused for its buffer is tried again (about 0.25 s
+/// in all), as DirectStorage's are.
+const READ_RETRIES: u32 = 8;
+
+/// Errors with which the host refuses a read for its buffer: what a
+/// read-only destination gives.
+fn refused_for_the_buffer(error: u32) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_USER_BUFFER, ERROR_NOACCESS};
+    matches!(error, ERROR_NOACCESS | ERROR_INVALID_USER_BUFFER)
+}
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -535,59 +567,251 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
-    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    );
-    // The call's error is the title's to ask for.
-    // SAFETY: plain calls.
-    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-    // shortcut: a read that goes on after the call (overlapped) is written
-    // into pages the kernel has locked by now: it lands all the same, but a
-    // refresh that guards its blocks before it does will not see it.
-    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
-    }
-    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
-        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    static RETRIED: AtomicU64 = AtomicU64::new(0);
+    static SHORT: AtomicU64 = AtomicU64::new(0);
+    let real = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    let source = reads::Source::Handle(file as usize);
+    // An overlapped read names its offset; another reads at the file
+    // pointer, which a refused read leaves where it was (it is put back
+    // there all the same before a second try).
+    // SAFETY: the title's OVERLAPPED: `Internal`, `InternalHigh`, then the
+    // offset's low and high words.
+    let offset = (!overlapped.is_null()).then(|| unsafe {
+        let words = overlapped.cast::<u32>();
+        u64::from(words.add(4).read_unaligned()) | (u64::from(words.add(5).read_unaligned()) << 32)
+    });
+    let before = if overlapped.is_null() { reads::position(file) } else { None };
+    let mut tries = 0;
+    loop {
+        let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+        let done = real(file, buffer, len, read, overlapped);
+        // The call's error is the title's to ask for.
+        // SAFETY: plain calls.
+        let error = unsafe { GetLastError() };
+        if done == 0 && error == ERROR_IO_PENDING {
+            // The kernel has locked the destination's pages and writes them
+            // after the call: kept open until it is surely done.
+            writing.keep_for(PENDING_KEEP);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
+            reads::note("ReadFile (pending)", source, len.into(), 0, false);
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+            return done;
         }
+        drop(writing);
+        if done != 0 {
+            // SAFETY: the title's out parameter, or its OVERLAPPED's count.
+            let got = unsafe {
+                if !read.is_null() {
+                    read.read_unaligned()
+                } else if !overlapped.is_null() {
+                    overlapped.cast::<usize>().add(1).read_unaligned() as u32
+                } else {
+                    len
+                }
+            };
+            if tries > 0 {
+                tracing::info!(path = %reads::name(source), tries, len, "ReadFile: read after its buffer was opened again");
+            }
+            if got < len {
+                // Short of the file's end is something else than its end.
+                let end = match offset {
+                    Some(at) => Some(at + u64::from(got)),
+                    None => reads::position(file),
+                };
+                if let (Some(end), Some(size)) = (end, reads::size(source))
+                    && end < size
+                    && let Some(n) = reads::tell(&SHORT)
+                {
+                    tracing::warn!(
+                        n,
+                        path = %reads::name(source),
+                        buffer = format_args!("{buffer:p}"),
+                        asked = len,
+                        got,
+                        end,
+                        size,
+                        guarded = %reads::guarded(buffer as usize, len as usize),
+                        "ReadFile: fewer bytes than asked, short of the file's end"
+                    );
+                }
+            }
+            reads::note("ReadFile", source, len.into(), got.into(), false);
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+            return done;
+        }
+        let again = refused_for_the_buffer(error)
+            && tries < READ_RETRIES
+            && reads::on_disk(source)
+            && (offset.is_some() || before.is_some_and(|at| put_back(file, at)));
+        if let Some(n) = reads::tell(if again { &RETRIED } else { &FAILED }) {
+            tracing::warn!(
+                n,
+                path = %reads::name(source),
+                buffer = format_args!("{buffer:p}"),
+                len,
+                offset = offset.or(before),
+                error,
+                tries,
+                guarded = %reads::guarded(buffer as usize, len as usize),
+                "{}",
+                if again {
+                    "ReadFile: the host refused the title's buffer; opened again and tried again"
+                } else {
+                    "ReadFile: a read of the title's failed"
+                }
+            );
+        }
+        if !again {
+            reads::note("ReadFile", source, len.into(), 0, true);
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+            return done;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1 << tries));
+        tries += 1;
     }
-    drop(writing);
-    // SAFETY: as above.
-    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
-    done
+}
+
+/// Moves a handle's file pointer back to `at`; whether it is there.
+fn put_back(file: *mut c_void, at: u64) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_BEGIN, SetFilePointerEx};
+    // SAFETY: the title's handle, whose pointer was at `at` before its read.
+    unsafe { SetFilePointerEx(file, at as i64, std::ptr::null_mut(), FILE_BEGIN) != 0 }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
 /// through the kernel, whose write fails on a guarded block instead of
-/// faulting into the guard. So the bytes are read beside, a chunk at a time
-/// (a caller may ask for far more than the file holds), and copied in from
-/// user mode, where a guarded block faults into the guard like the title's
-/// own writes. Returns the items read, as the CRT does; the bytes of a
-/// partial last item are copied too, as the CRT leaves them.
+/// faulting into the guard: the destination is opened for the call, as for
+/// `ReadFile`. (Smaller ones are copied in from the stream's buffer in user
+/// mode, where a guarded block faults into the guard like the title's own
+/// writes; `setvbuf` keeps that buffer the CRT's own.) A failed read cannot
+/// be tried again (the stream's position is the CRT's), so it is a warning.
+/// Returns the items read, as the CRT does.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let asked = size.saturating_mul(count);
+    let writing = victory_gpu::kernel_writing(buffer as usize, asked);
+    let items = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    // SAFETY: a plain call.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    drop(writing);
+    let source = reads::Source::Stream(stream as usize);
+    let failed =
+        items < count && !stream.is_null() && host!("ucrtbase.dll", "ferror": extern "C" fn(File) -> i32)(stream) != 0;
+    if failed && let Some(n) = reads::tell(&FAILED) {
+        let doserrno = host!("ucrtbase.dll", "__doserrno": extern "C" fn() -> *mut u32)();
+        // SAFETY: the CRT's per-thread error word.
+        let doserrno = unsafe { doserrno.as_ref() }.copied();
+        tracing::warn!(
+            n,
+            path = %reads::name(source),
+            buffer = format_args!("{buffer:p}"),
+            asked,
+            items,
+            size,
+            doserrno,
+            error,
+            guarded = %reads::guarded(buffer as usize, asked),
+            "fread: a read of the title's failed"
+        );
+    }
+    reads::note("fread", source, asked as u64, items.saturating_mul(size) as u64, failed);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    items
+}
+
+/// `_read(fd, buffer, count)`: a kernel read into the caller's buffer, as
+/// `fread`'s large ones (libHttpClient's).
+pub extern "C" fn _read(descriptor: i32, buffer: *mut c_void, count: u32) -> i32 {
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let writing = victory_gpu::kernel_writing(buffer as usize, count as usize);
+    let n = host!("ucrtbase.dll", "_read": extern "C" fn(i32, *mut c_void, u32) -> i32)(descriptor, buffer, count);
+    // SAFETY: a plain call.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    drop(writing);
+    let source = reads::Source::Descriptor(descriptor);
+    if n < 0
+        && let Some(told) = reads::tell(&FAILED)
+    {
+        tracing::warn!(
+            n = told,
+            path = %reads::name(source),
+            buffer = format_args!("{buffer:p}"),
+            count,
+            error,
+            guarded = %reads::guarded(buffer as usize, count as usize),
+            "_read: a read of the title's failed"
+        );
+    }
+    reads::note("_read", source, count.into(), n.max(0) as u64, n < 0);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    n
+}
+
+/// `setvbuf(stream, buffer, mode, size)`: a buffer of the title's would be
+/// filled by the kernel at every refill of the stream (`fgetc`, small
+/// `fread`s), where no wrapper of ours opens it. The CRT is given none and
+/// makes its own of that size; the title never reads a stream's buffer
+/// itself (its contents are the CRT's, and `std::basic_filebuf` asks for
+/// the pointers again after `setvbuf`).
+pub extern "C" fn setvbuf(stream: File, buffer: *mut c_char, mode: i32, size: usize) -> i32 {
+    const _IONBF: i32 = 4;
+    let buffer = if buffer.is_null() || mode == _IONBF {
+        buffer
+    } else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(size, "setvbuf: a stream buffer of the title's left out; the CRT makes its own"));
+        std::ptr::null_mut()
+    };
+    host!("ucrtbase.dll", "setvbuf": extern "C" fn(File, *mut c_char, i32, usize) -> i32)(stream, buffer, mode, size)
+}
+
+/// A file opened by one of our wrappers: a name kept for an earlier one
+/// with the same handle is another file's.
+fn handle_opened(handle: Handle) -> Handle {
+    if handle as isize != -1 {
+        reads::opened(reads::Source::Handle(handle as usize));
+    }
+    handle
+}
+
+fn stream_opened(stream: File) -> File {
+    if !stream.is_null() {
+        reads::opened(reads::Source::Stream(stream as usize));
+    }
+    stream
+}
+
+fn descriptor_opened(descriptor: i32) -> i32 {
+    if descriptor >= 0 {
+        reads::opened(reads::Source::Descriptor(descriptor));
+    }
+    descriptor
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
-    match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
-            p.as_ptr(),
-            widen(mode).as_ptr(),
-        ),
-        None => {
-            host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
-                path, mode,
-            )
+    stream_opened(
+        match narrow(path) {
+            Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+                p.as_ptr(),
+                widen(mode).as_ptr(),
+            ),
+            None => {
+                host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
+                    path, mode,
+                )
+            }
         }
-    }
+    )
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
@@ -610,25 +834,29 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
-    match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
-            p.as_ptr(),
-            flags,
-            mode,
-        ),
-        None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
-            path, flags, mode,
-        ),
-    }
+    descriptor_opened(
+        match narrow(path) {
+            Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+                p.as_ptr(),
+                flags,
+                mode,
+            ),
+            None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
+                path, flags, mode,
+            ),
+        }
+    )
 }
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
-        p.ptr(),
-        flags,
-        mode,
+    descriptor_opened(
+        host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+            p.ptr(),
+            flags,
+            mode,
+        )
     )
 }
 
@@ -681,29 +909,33 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
-        p.ptr(),
-        mode,
-        protection,
+    stream_opened(
+        host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+            p.ptr(),
+            mode,
+            protection,
+        )
     )
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
-    match narrow(path) {
-        Some(p) => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
-                p.as_ptr(),
-                mode,
-                protection,
-            )
+    stream_opened(
+        match narrow(path) {
+            Some(p) => {
+                host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+                    p.as_ptr(),
+                    mode,
+                    protection,
+                )
+            }
+            None => {
+                host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
+                    path, mode, protection,
+                )
+            }
         }
-        None => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
-                path, mode, protection,
-            )
-        }
-    }
+    )
 }
 
 pub(crate) fn module() -> HleModule {
@@ -723,6 +955,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(ReadFile),
             hle_export!(fread),
+            hle_export!(_read),
+            hle_export!(setvbuf),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
             hle_export!(CreateFile2),
@@ -770,6 +1004,153 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    /// A fresh allocation of `pages` 4 KiB pages; `guard(page, true)` makes
+    /// one read-only, as a guard of the GPU side's would be.
+    fn pages(pages: usize) -> (usize, impl Fn(usize, bool) -> i32 + Send + Copy + 'static) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        // SAFETY: a fresh allocation of the test's own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), pages * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let guard = move |page: usize, on: bool| {
+            let mut old = 0;
+            // SAFETY: as above, one of its pages.
+            unsafe { VirtualProtect((at + page * 4096) as *const _, 4096, if on { PAGE_READONLY } else { PAGE_READWRITE }, &mut old) }
+        };
+        (at, guard)
+    }
+
+    /// The host refuses a read into a page that is read-only for a moment
+    /// (guarded again between our opening it and the kernel's write): the
+    /// read is tried again from where it began, and lands whole.
+    #[test]
+    fn a_read_file_into_memory_guarded_for_a_moment_is_tried_again() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::windows::io::AsRawHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let bytes: Vec<u8> = (0..5 * 4096).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        let (at, guard) = pages(3);
+        assert_ne!(guard(1, true), 0);
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            guard(1, false)
+        });
+        let mut n = 0;
+        let done = ReadFile(file.as_raw_handle().cast(), at as *mut u8, 3 * 4096, &mut n, std::ptr::null_mut());
+        assert_ne!(opener.join().unwrap(), 0);
+        assert_ne!(done, 0, "tried again once the page was open");
+        assert_eq!(n, 3 * 4096);
+        // SAFETY: the allocation, all of it readable.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 3 * 4096) }, &bytes[4096..4 * 4096]);
+        assert_eq!(file.stream_position().unwrap(), 4 * 4096, "read once, from where it began");
+
+        // An overlapped read names its own offset; tried again there.
+        assert_ne!(guard(0, true), 0);
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            guard(0, false)
+        });
+        // SAFETY: plain data, the offset's words set below.
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.Offset = 2 * 4096;
+        let done = ReadFile(file.as_raw_handle().cast(), at as *mut u8, 4096, &mut n, (&raw mut overlapped).cast());
+        assert_ne!(opener.join().unwrap(), 0);
+        assert_ne!(done, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 4096) }, &bytes[2 * 4096..3 * 4096]);
+    }
+
+    /// A read the host keeps refusing for its buffer fails as it did, with
+    /// the title's error, after the tries.
+    #[test]
+    fn a_read_file_into_memory_that_stays_read_only_fails() {
+        use std::os::windows::io::AsRawHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, vec![1u8; 8192]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (at, guard) = pages(1);
+        assert_ne!(guard(0, true), 0);
+        let mut n = 0;
+        let done = ReadFile(file.as_raw_handle().cast(), at as *mut u8, 4096, &mut n, std::ptr::null_mut());
+        // SAFETY: a plain call.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert_eq!(done, 0);
+        assert!(refused_for_the_buffer(error), "error {error}");
+        // SAFETY: the allocation, readable.
+        assert_eq!(unsafe { (at as *const u8).read() }, 0, "nothing landed");
+    }
+
+    /// An overlapped read that goes on after the call (a pipe with nothing
+    /// in it yet) lands when the data comes, and its call says so.
+    #[test]
+    fn an_overlapped_read_left_pending_lands() {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GetLastError, WAIT_OBJECT_0};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_INBOUND, WriteFile};
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const PIPE_TYPE_BYTE: u32 = 0;
+        let pipe = host!("kernel32.dll", "CreateNamedPipeW": extern "system" fn(*const u16, u32, u32, u32, u32, u32, u32, *const c_void) -> Handle);
+        let name = w(&format!(r"\\.\pipe\victory-read-test-{}", std::process::id()));
+        // SAFETY: plain calls on handles of the test's own.
+        unsafe {
+            let server = pipe(name.as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE, 1, 0, 4096, 0, std::ptr::null());
+            assert_ne!(server as isize, -1);
+            let client = CreateFileW(name.as_ptr(), GENERIC_WRITE, 0, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut());
+            assert_ne!(client as isize, -1);
+            let (at, _) = pages(1);
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            overlapped.hEvent = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            let done = ReadFile(server, at as *mut u8, 13, std::ptr::null_mut(), (&raw mut overlapped).cast());
+            assert_eq!((done, GetLastError()), (0, ERROR_IO_PENDING));
+            let mut n = 0;
+            assert_ne!(WriteFile(client, b"from the pipe".as_ptr(), 13, &mut n, std::ptr::null_mut()), 0);
+            assert_eq!(WaitForSingleObject(overlapped.hEvent, 5000), WAIT_OBJECT_0);
+            assert_ne!(GetOverlappedResult(server, &overlapped, &mut n, 0), 0);
+            assert_eq!(n, 13);
+            assert_eq!(std::slice::from_raw_parts(at as *const u8, 13), b"from the pipe");
+            CloseHandle(overlapped.hEvent);
+            CloseHandle(client);
+            CloseHandle(server);
+        }
+    }
+
+    /// `_read` reads into the caller's buffer; a stream buffer the title
+    /// names for `setvbuf` is left alone (the CRT fills one of its own).
+    #[test]
+    fn descriptor_reads_and_title_stream_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let path = format!("{}\0", path.display());
+        const O_RDONLY: i32 = 0;
+        const O_BINARY: i32 = 0x8000;
+        let fd = _open(path.as_ptr().cast(), O_RDONLY | O_BINARY, 0);
+        assert!(fd >= 0);
+        let mut out = [0u8; 16];
+        assert_eq!(_read(fd, out.as_mut_ptr().cast(), 16), 10);
+        assert_eq!(&out[..10], b"0123456789");
+        host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
+
+        let f = fopen(path.as_ptr().cast(), c"rb".as_ptr());
+        assert!(!f.is_null());
+        let mut buffer = vec![0xaau8; 64];
+        const _IOFBF: i32 = 0;
+        assert_eq!(setvbuf(f, buffer.as_mut_ptr().cast(), _IOFBF, buffer.len()), 0);
+        let mut got = [0u8; 4];
+        assert_eq!(fread(got.as_mut_ptr(), 1, 4, f), 4);
+        assert_eq!(&got, b"0123");
+        assert!(buffer.iter().all(|&b| b == 0xaa), "the CRT read into a buffer of its own");
+        assert_eq!(fread(out.as_mut_ptr(), 1, 16, f), 6, "short at the file's end, no failure");
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
     }
 
     #[test]

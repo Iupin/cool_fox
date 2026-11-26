@@ -59,12 +59,14 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if super::builder_asked() {
             return false;
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
+        // What they would have written is then never written (2026-11-26:
+        // with them left out about two launches in three were posterised;
+        // with them kept, or with the builder on, none of 9).
         std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
@@ -72,8 +74,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if super::builder_asked() {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
@@ -150,10 +151,15 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): why it is left out,
+/// its shaders that do not translate, else "refused" or "being made";
+/// `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    // A pipeline left out is never made: not "being made".
+    if let Some(why) = p.left_out {
+        return Some(why.to_owned());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),

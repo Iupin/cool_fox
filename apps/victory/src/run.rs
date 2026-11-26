@@ -206,6 +206,10 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
+    // `VICTORY_WRITERS=<hex address>+<hex length>,...` and
+    // `VICTORY_WRITERS_OF=<shader hash>:s<slot>+<offset>,...`: which title
+    // code writes those ranges (docs/crates/victory-gpu-memory.md).
+    victory_hle::watch_writers();
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -256,8 +260,10 @@ fn watch(base: usize, size: usize) {
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
 /// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
-/// through slower frames with its tick flag poked. The address must be
-/// writable title data.
+/// through slower frames with its tick flag poked. The address is title
+/// data or code: a page mapped execute-read is made execute-read-write
+/// once, at start, so one byte of an instruction can be patched (an
+/// experiment on a branch, say); other pages keep their protection.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn poke(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_POKE") else {
@@ -270,6 +276,30 @@ fn poke(base: usize, size: usize) {
         .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
         .filter(|&(rva, _)| rva < size)
         .collect();
+    // A poke into code (a page mapped execute-read) needs the page writable:
+    // it is made execute-read-write. Pages that were writable keep their
+    // protection, so the write guards of data pages are left alone.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(address: *const u8, size: usize, new: u32, old: *mut u32) -> i32;
+    }
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    for &(rva, _) in &pokes {
+        let mut old = 0u32;
+        let at = (base + rva) as *const u8;
+        // SAFETY: a byte inside the mapped image, checked above.
+        let ok = unsafe { VirtualProtect(at, 1, PAGE_EXECUTE_READWRITE, &mut old) } != 0;
+        if ok && old != PAGE_EXECUTE_READ {
+            let mut was = 0u32;
+            // SAFETY: as above; puts back what the page had.
+            unsafe { VirtualProtect(at, 1, old, &mut was) };
+        }
+        eprintln!(
+            "VIctory: poke title+{rva:#x}: page protection was {old:#x} (made writable: {})",
+            ok && old == PAGE_EXECUTE_READ
+        );
+    }
     std::thread::spawn(move || {
         loop {
             for &(rva, byte) in &pokes {

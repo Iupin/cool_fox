@@ -28,13 +28,29 @@ settings:
 | Console profile | Series S |
 | Build | release, Rust 1.98.1, MSVC 14.51 |
 
-| | Before | After |
-|---|---|---|
-| The prologue's first room, settled | 2.9 to 3.1 fps (320 to 350 ms a frame, 235 to 286 ms of it on the card) | 14 to 15 fps (67 to 70 ms, 0 to 3 ms on the card) |
-| Intro and loading | 30 fps | 30 fps |
+What to expect on this machine now, with ray tracing on (the default):
 
-One room is not the whole title: busier scenes are slower, and long sessions
-and memory over time were not measured here.
+| | |
+|---|---|
+| Intro and loading | 30 fps |
+| The prologue's opening scene | 9 to 10 fps (about 100 to 108 ms a frame: some 66 ms preparing on the CPU, 14 to 17 ms on the card) |
+| **The playable open world** | **8 to 12 fps** (as seen in play; not yet measured from the log) |
+| Video memory | about 8.5 GB in use of a budget of 9.0 GB |
+| Process memory | about 20 GB |
+
+How it got there, in the prologue's first room:
+
+| | Frame rate | A frame |
+|---|---|---|
+| As this checkout started | 2.9 to 3.1 fps | 320 to 350 ms, 235 to 286 ms of it on the card |
+| After the two memory fixes below, ray tracing off | 14 to 15 fps | 67 to 70 ms, 0 to 3 ms on the card |
+| With ray tracing on, as the title is meant to run | 9 to 10 fps | 100 to 108 ms, 14 to 17 ms on the card |
+
+Ray tracing costs about a third of the frame rate here. It is on by default
+all the same: the title always runs with it, and with it left out about two
+launches in three were posterised (below). Long sessions and memory over time
+were not measured; one launch with ray tracing on ended when the PC's memory
+was 98 % in use, and 32 GB is little for it.
 
 What changed, with the measurements, is in [docs/findings.md](docs/findings.md)
 and the crate documents under [docs/crates](docs/crates):
@@ -50,21 +66,24 @@ and the crate documents under [docs/crates](docs/crates):
   take all of it.
 - **`ClearUnorderedAccessViewUint` and `Float`** on command lists, which the
   upscaler calls and which were missing.
-- Clippy and the tests pass again (`cargo clippy` both ways; 944 tests pass, 45 are ignored).
+- Clippy and the tests pass again (`cargo clippy` both ways; 967 tests pass, 45 are ignored).
+
+- **Ray tracing is on by default** (`VICTORY_BVH_BUILDER=0` or
+  `scripts\play.ps1 -NoRayTracing` turns it off). With it off, 32 launches of
+  47 were posterised for the whole session: smooth shading collapsed to a few
+  levels in each colour channel. With it on, none of 9. That was taken as the
+  fix without a longer run of launches. How leaving it out causes the fault,
+  and why a third of such launches were right all the same, is not known;
+  `docs/bug-journal.md` (2026-11-26) has what was ruled out and how to take
+  the search up again.
 
 Known here and not solved:
 
-- **Some launches are posterised.** A launch is either right throughout or
-  wrong throughout: smooth shading collapses to a few levels in each colour
-  channel, and some characters' skin is black. It shows in the title's last
-  composite pass, as if its colour tables were read without filtering, though
-  the tables, the curves, the constants, the pipeline and its samplers were
-  each found to be right. What differs between a good launch and a bad one is
-  not found. `docs/bug-journal.md` has what was ruled out and the switches
-  added to look (`VICTORY_DUMP_TARGETS` for 3D and 1D textures,
-  `VICTORY_CAPTURE_CONSTANTS`, `VICTORY_ROOT_LOG`, `VICTORY_LINEAR_SAMPLERS`).
-- **The frame is now bound by the CPU**: about 53 ms of 67 is the layer
+- Some characters' skin is black in some launches, with or without the fault
+  above (perhaps textures that arrive late; not looked into).
+- **The frame is bound by the CPU**: about 66 ms of 100 is the layer
   preparing submissions.
+- More is wrong in the open world; it has not been written down yet.
 - Three of the title's compute programs keep 64-lane waves and do not
   translate for a 32-lane card; their dispatches are left out.
 - An NVIDIA card shows shaders 1,000,000 view slots and the title's heap has
@@ -101,7 +120,7 @@ It started at 280 ms a frame in the same scenes two days earlier.
 What is known to be wrong:
 
 - Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
+- Rooms with little direct light are too dark with `-NoRayTracing`.
 - Textures of what just came into view appear late while the title streams.
 - The first run with a new driver or a new build stutters while the driver makes
   pipelines (`victory warm` makes them ahead).
@@ -122,7 +141,8 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+something is wrong. `-NoRayTracing` turns the title's ray tracing off (faster;
+`VICTORY_AMBIENT` then stands in for its indirect light).
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

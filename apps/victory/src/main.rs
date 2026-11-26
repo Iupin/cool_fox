@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(feature = "diagnostics")]
+mod code;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -152,6 +154,24 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Write the bytes of a title image (exe or DLL) at `rva..rva + len`, as
+    /// the loader maps them, to a file outside the repository (raw `.bin`
+    /// and a `.txt` hex listing), for an external disassembler: the code
+    /// the writers watch names as `module+rva` (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    CodeBytes {
+        file: PathBuf,
+        /// The first byte's rva (hex).
+        #[arg(value_parser = code::hex)]
+        rva: u32,
+        /// How many bytes (hex).
+        #[arg(value_parser = code::hex)]
+        len: u32,
+        /// The raw file to write (default `<cache>/code/<name>-<rva>-<len>.bin`);
+        /// the hex listing goes beside it as `.txt`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -230,6 +250,8 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        #[cfg(feature = "diagnostics")]
+        Command::CodeBytes { file, rva, len, out } => code::run(&file, rva, len, out),
         Command::Config => show_config(),
     }
 }

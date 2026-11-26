@@ -1380,6 +1380,10 @@ struct Guards {
     /// left as they are by [`guard`], which reports them written.
     kernel: Vec<(usize, usize)>,
     changing: Vec<(usize, usize)>,
+    /// Blocks a kernel write may still land in after the call that began it
+    /// returned (an overlapped read, [`KernelWrite::keep_for`]): left alone
+    /// as `kernel` is, until the moment given.
+    kept: Vec<(usize, usize, std::time::Instant)>,
     /// Blocks whose page is shown at other addresses too and that were made
     /// read-only together with those (which are in it as well): what opens
     /// one opens them all. (A write's range can be huge, `fread`'s, so only
@@ -1392,6 +1396,18 @@ struct Guards {
 impl Guards {
     fn left_alone(&self, block: usize) -> bool {
         self.kernel.iter().chain(&self.changing).any(|&(first, last)| (first..last).contains(&block))
+            || (!self.kept.is_empty() && {
+                let now = std::time::Instant::now();
+                self.kept.iter().any(|&(first, last, until)| (first..last).contains(&block) && now < until)
+            })
+    }
+
+    /// Forgets the kept ranges whose time is up.
+    fn forget_kept(&mut self) {
+        if !self.kept.is_empty() {
+            let now = std::time::Instant::now();
+            self.kept.retain(|&(.., until)| now < until);
+        }
     }
 
     /// Whether `block` is left open for now: the title has just written it.
@@ -1421,6 +1437,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     foreign: BTreeSet::new(),
     kernel: Vec::new(),
     changing: Vec::new(),
+    kept: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
@@ -1596,6 +1613,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     }
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
         crate::descriptor::host::remapped(other, BLOCK);
+    }
+    for &(at, len) in spans {
+        crate::writers::told(crate::writers::Kind::Landed, at, len);
     }
     (noted, before)
 }
@@ -2026,6 +2046,8 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+        // The writers watch's pages in it stay read-only.
+        crate::writers::reguard(block);
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -2052,11 +2074,13 @@ pub fn writing(at: usize, len: usize) {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    crate::writers::told(crate::writers::Kind::Told, at, len);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]); and the pages of it the writers watch
+/// keeps read-only are open (`crate::writers::kernel_begin`).
+pub struct KernelWrite(usize, usize, Option<Box<crate::writers::Held>>);
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -2066,9 +2090,14 @@ pub struct KernelWrite(usize, usize);
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // Held before the blocks open, which leaves them read-only otherwise.
+    let held = crate::writers::kernel_begin(at, len);
     {
         let mut g = guards_timed();
         open(&mut g, at, at.saturating_add(len));
+        if let Some(held) = &held {
+            crate::writers::kernel_open(held);
+        }
         if len != 0 {
             // Nothing known of them stands while they are left alone.
             let absent: Vec<usize> = g.absent.range(first..last).collect();
@@ -2082,18 +2111,74 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, if len == 0 { first } else { last }, held)
+}
+
+impl KernelWrite {
+    /// The call that began the write returned before the write is done (an
+    /// overlapped read left pending): its blocks stay left alone for `time`
+    /// more, so that no refresh guards them and takes them for clean before
+    /// the bytes are there. A kernel write that started is not stopped by a
+    /// guard (its pages are locked), but one a refresh made clean before it
+    /// landed would keep the bytes from before in every copy of them; and a
+    /// device that copies into the caller's buffer at completion would fail
+    /// on a guarded block. Once the time is up the blocks are guarded at the
+    /// next refresh, which counts them as written.
+    pub fn keep_for(mut self, time: std::time::Duration) {
+        let (first, last) = (self.0, self.1);
+        if let Some(held) = self.2.take() {
+            crate::writers::kernel_keep(held, time);
+        }
+        std::mem::forget(self);
+        if first == last {
+            return;
+        }
+        let mut g = guards();
+        if let Some(i) = g.kernel.iter().position(|&r| r == (first, last)) {
+            g.kernel.swap_remove(i);
+        }
+        g.forget_kept();
+        g.kept.push((first, last, std::time::Instant::now() + time));
+    }
 }
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
-        if self.0 == self.1 {
-            return;
+        if self.0 != self.1 {
+            let mut g = guards();
+            if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
+                g.kernel.swap_remove(i);
+            }
+            g.forget_kept();
         }
-        let mut g = guards();
-        if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
-            g.kernel.swap_remove(i);
+        if let Some(held) = self.2.take() {
+            crate::writers::kernel_end(held);
         }
+    }
+}
+
+/// How title memory `[at, at + len)` is guarded now, for a report of a
+/// kernel write into it that failed: its blocks read-only by our hand, and
+/// of its blocks those whose pages are also shown, and guarded together, at
+/// other addresses (`aliased`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Guarded {
+    pub blocks: usize,
+    pub read_only: usize,
+    pub other_views: usize,
+}
+
+/// See [`Guarded`]. Takes the guards' lock: for reports, not for every read.
+pub fn title_memory_guarded(at: usize, len: usize) -> Guarded {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if first >= last {
+        return Guarded::default();
+    }
+    let g = guards();
+    Guarded {
+        blocks: last - first,
+        read_only: g.protected.range(first..last).count(),
+        other_views: g.aliased.range(first..last).count(),
     }
 }
 
@@ -2171,6 +2256,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
+    if pages {
+        crate::writers::told(crate::writers::Kind::Pages, at, len);
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -2442,6 +2530,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    // What the writers watch keeps read-only there is read-write now.
+    crate::writers::remapped(at, len);
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -2554,6 +2644,87 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     g
 }
 
+/// For the writers watch (`crate::writers`): a write faulted at `at`, in its
+/// 4 KiB page at `page`, which that watch keeps read-only. What the handler
+/// does with a write to a block we guard is done (the block opened at all
+/// its views, noted written and resting), so that the copies of it take the
+/// write; then, under the same lock (no refresh guards the block between),
+/// the page is made writable for the one instruction. Whether it is.
+pub(crate) fn writer_opens(at: usize, page: usize, rip: usize) -> bool {
+    let block = at / BLOCK;
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let mut g = guards();
+    let opened = open(&mut g, at, at + 1);
+    if opened != 0 {
+        g.opened(block);
+    }
+    let writable = crate::writers::read_write(page);
+    drop(g);
+    #[cfg(feature = "diagnostics")]
+    if opened != 0 {
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32, began.elapsed().as_nanos() as u64);
+        crate::faultbook::note(crate::faultbook::What::Site, rip, block, 0);
+    }
+    let _ = (block, rip);
+    writable
+}
+
+/// For the writers watch: the 4 KiB page at `page` was made read-only again
+/// by the end of a step (or a kernel write) just as the watch let it go,
+/// perhaps after its release made it read-write: read-write again, unless
+/// we guard its block (then it is read-only, and ours, as it should be).
+/// With the guards' lock, as the release.
+pub(crate) fn writer_retired(page: usize) {
+    let g = guards();
+    if !g.protected.contains(page / BLOCK) {
+        crate::writers::read_write(page);
+    }
+}
+
+/// For the writers watch: makes the 4 KiB pages `pages` read-only, with the
+/// guards' lock held, each that is read-write now, or read-only by our hand
+/// (its block guarded, or `.1`: the watch's own from before). Whether each
+/// is read-only now; another keeps its protection.
+pub(crate) fn writers_protect(pages: &[(usize, bool)]) -> Vec<bool> {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let g = guards();
+    pages
+        .iter()
+        .map(|&(page, ours)| {
+            let mut old = 0;
+            // SAFETY: only the protection of a page of title memory changes.
+            if unsafe { VirtualProtect(page as *const _, 4096, PAGE_READONLY, &mut old) } == 0 {
+                return false;
+            }
+            if old == PAGE_READWRITE || (old == PAGE_READONLY && (ours || g.protected.contains(page / BLOCK))) {
+                return true;
+            }
+            // SAFETY: as above, back to what it was.
+            unsafe { VirtualProtect(page as *const _, 4096, old, &mut old) };
+            false
+        })
+        .collect()
+}
+
+/// For the writers watch: the 4 KiB pages `pages` are let go: read-write
+/// again, but for those whose block we guard (read-only, and ours, still).
+pub(crate) fn writers_release(pages: &[usize]) {
+    let g = guards();
+    for &page in pages {
+        if !g.protected.contains(page / BLOCK) {
+            crate::writers::read_write(page);
+        }
+    }
+}
+
+/// [`guard`], for the writers watch's tests.
+#[cfg(test)]
+pub(crate) fn guard_now(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard(start, end)
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -2578,6 +2749,12 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // The writers watch's pages and steps (`crate::writers`) first: it
+        // does what follows for the blocks it meets itself.
+        // SAFETY: the exception being dispatched on this thread.
+        if let Some(verdict) = unsafe { crate::writers::on_exception(r, &mut *context) } {
+            return verdict;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
@@ -2899,6 +3076,48 @@ mod tests {
         drop(writing);
         // Seen by the next refresh, and guarded again.
         assert_eq!(guard(at, at + 2 * BLOCK), Some(pages(0).collect()));
+        assert!(!writable(at));
+        assert_eq!(guard(at, at + 2 * BLOCK), Some(Vec::new()));
+        title_memory_unmapping(at, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    /// An overlapped read left pending when its call returned: what it
+    /// writes is kept open, and counted as written at every refresh, until
+    /// its time is up, so bytes that land late are seen; then guarded again.
+    #[test]
+    fn a_kernel_write_kept_past_its_call_stays_open_until_its_time_is_up() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        let page = at / PAGE;
+        assert!(guard(at, at + 2 * BLOCK).is_some());
+        assert_eq!(guard(at, at + 2 * BLOCK), Some(Vec::new()));
+        assert!(!writable(at));
+        let time = std::time::Duration::from_millis(300);
+        let kept_at = std::time::Instant::now();
+        kernel_writing(at + 100, 13).keep_for(time);
+        assert_eq!(title_memory_guarded(at, 2 * BLOCK), Guarded { blocks: 2, read_only: 1, other_views: 0 });
+        // Refreshes while the read may still land: the block is new to each.
+        for _ in 0..3 {
+            assert_eq!(guard(at, at + 2 * BLOCK), Some(vec![page]), "the read may still land");
+            assert!(writable(at) && !writable(at + BLOCK));
+        }
+        // The bytes land late, through no fault of ours.
+        // SAFETY: our view, left writable above.
+        unsafe { std::ptr::copy_nonoverlapping(b"from the disk".as_ptr(), (at + 100) as *mut u8, 13) };
+        assert!(kept_at.elapsed() < time, "the test ran too slowly to say anything");
+        std::thread::sleep(time);
+        // Seen, and guarded again.
+        assert_eq!(guard(at, at + 2 * BLOCK), Some(vec![page]));
         assert!(!writable(at));
         assert_eq!(guard(at, at + 2 * BLOCK), Some(Vec::new()));
         title_memory_unmapping(at, 2 * BLOCK);

@@ -329,6 +329,14 @@ pub(crate) fn busiest() -> String {
     all.iter().take(16).map(of).collect::<Vec<_>>().join(", ")
 }
 
+/// Where the store at the start of `code` (the instruction at the context's
+/// `Rip`) writes and how many bytes: for the writers watch
+/// (`crate::writers`), which reports the size. `None` for instructions the
+/// emulation does not know (string stores among them).
+pub(crate) fn store_extent(code: &[u8], context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> Option<(usize, usize)> {
+    decode::store(code, context).map(|s| (s.at, s.size))
+}
+
 /// Does the store that faulted at `at`, a byte of a guarded block, beside the
 /// guards; `false` if it is to open the block (and nothing was done).
 pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, at: usize) -> bool {

@@ -1,6 +1,6 @@
 # `victory` — the command-line front end (`apps/victory`)
 
-One binary, `victory.exe`, built from `apps/victory` (~3.2k lines, 8 files).
+One binary, `victory.exe`, built from `apps/victory` (~3.4k lines, 9 files).
 It parses arguments with clap (`apps/victory/src/main.rs:20-168`), loads the
 configuration from `victory-core`, and hands the work to the big crates:
 the loader ([victory-loader.md](victory-loader.md)), the runtime
@@ -15,8 +15,9 @@ Launchers, config precedence, policy, CI: [../reference/repo-tooling.md](../refe
 
 | file | lines | contents |
 |---|---:|---|
-| `src/main.rs` | 280 | `Cli`/`Command` clap definitions, dispatch, `show_config`, `default_paths` |
-| `src/run.rs` | 534 | `run`: prepare, map, bind, start the title; late `LoadLibrary` of title DLLs (`LateDlls`, re-entrant `LoaderLock`); diagnostics aids (`watch`, `poke`, crash saves); AVX2 pre-flight |
+| `src/main.rs` | 303 | `Cli`/`Command` clap definitions, dispatch, `show_config`, `default_paths` |
+| `src/run.rs` | 538 | `run`: prepare, map, bind, start the title; late `LoadLibrary` of title DLLs (`LateDlls`, re-entrant `LoaderLock`); diagnostics aids (`watch`, `poke`, the writers watch, crash saves); AVX2 pre-flight |
+| `src/code.rs` | 131 | `code-bytes` (diagnostics builds): an image's bytes at an rva, as mapped, to a `.bin` and a hex `.txt` outside the repository |
 | `src/census.rs` | 334 | `census`: import coverage over many PE images |
 | `src/inspect.rs` | 154 | `inspect` (one PE image) and `lib-exports` (import library) |
 | `src/shader.rs` | 231 | `shader-info`; also `sources()` (find DXBC containers raw or inside SGD5 files) and `MAX_FILE` (2 GiB) shared with `translate` |
@@ -43,6 +44,7 @@ if none is configured.
 | `warm` (Windows) | make host pipelines of every pipeline recorded by earlier runs, so the driver's disk cache has them; resumable | `--jobs N` processes (default 2/3 of cores); `--limit N`; `--again` redo ones done before; `--used` only those earlier runs drew with (`early-pipelines.txt`); hidden `--these <i,j,…>` (child mode) | `victory_hle::known_pipelines` (= `victory_gpu::pipeline::known`) | `<cache>/pipelines/{warm-done,warm-bad,slow-pipelines}.txt` |
 | `run <exe>` | prepare, map and bind the title; with `--execute`, run it | `--unimplemented trap\|zero` (default `trap`); `--strict` no host pass-through; `--execute`; `--console series-x\|series-s` (default `series-x`); `-- <title args>` passed to the title's command line | see [run sequence](#run-sequence) | `<cache>/images`, `<cache>/shaders`, `<cache>/pipelines`, `<data>/<TITLEID>/{storage,temp}`, `<data>/<TITLEID>/crashes.log` |
 | `replay <folder>` (Windows + `diagnostics`) | run a recorded frame's GPU work again; timing, A/B of shader variants, divergence search, pixel history | ~50 flags, [below](#replay) and [docs/replay.md](../replay.md) | `victory_hle::replay::play` | stdout; images/shaders into the capture folder |
+| `code-bytes <file> <rva> <len>` (`diagnostics`) | the bytes of a title image (exe or DLL) at `rva..rva+len` (hex), from its prepared copy as the loader maps it (zeros past a section's raw data; an error outside the sections), for an external disassembler: the tree has no general x86-64 disassembler | `--out <file>` the raw file (default `<cache>/code/<name>-<rva>-<len>.bin`); a hex listing goes beside it as `.txt`; prints an `objdump -D -b binary -m i386:x86-64 -M intel --adjust-vma=<rva>` line | `victory_loader::prepare`, `victory_pe::ImageInfo` | the `.bin` and `.txt` (refused inside the repository) |
 | `config` | print the resolved configuration and check each path against the asset policy | – | `victory_core::Config::load`, `ensure_outside_repo` | stdout; prints `POLICY VIOLATION: …` but still exits 0 |
 
 `--help` on any command shows clap's text, which is the doc comment on the
@@ -80,7 +82,9 @@ if none is configured.
 8. Without `--execute`: print `not executing` and exit 0.
 9. With it: `write_sites::apply_asked`, crash reporter + `crashes.log`, console
    timers, diagnostics aids (diag builds: `VICTORY_STACKS`, `VICTORY_PROFILE`,
-   audio capture, `VICTORY_WATCH`, `VICTORY_POKE`, `VICTORY_CRASH_SAVE`),
+   audio capture, `VICTORY_WATCH`, `VICTORY_POKE`, the writers watch
+   `VICTORY_WRITERS*` through `victory_hle::watch_writers`, whose window counts
+   from here, `VICTORY_CRASH_SAVE`),
    late-DLL loader for the title's `LoadLibrary`, then `spawn_main` and join.
 
 ### Replay
@@ -104,7 +108,7 @@ folder is the one given as `VICTORY_RECORD` (its last capture) or one capture.
 | build | how | what changes |
 |---|---|---|
 | release | `cargo build --release --locked -p victory` → `target\release\victory.exe` | logs capped at info (`victory-core/src/logging.rs:13`); no `replay`; diagnostics-gated switches ignored |
-| diag | `cargo build --locked --profile diag -p victory --features diagnostics` → `target\diag\victory.exe` | profile `diag` inherits `release` (`Cargo.toml:78`); feature `diagnostics` turns on `victory-core`, `-hle` (→ `-gpu`, `-loader`), `-loader`, `-shader` diagnostics (`apps/victory/Cargo.toml:21-27`); adds `replay`, debug/trace logging, capture, debug layer, scripted keys, stack dumps, `VICTORY_AB` |
+| diag | `cargo build --locked --profile diag -p victory --features diagnostics` → `target\diag\victory.exe` | profile `diag` inherits `release` (`Cargo.toml:78`); feature `diagnostics` turns on `victory-core`, `-hle` (→ `-gpu`, `-loader`), `-loader`, `-shader` diagnostics (`apps/victory/Cargo.toml:21-27`); adds `replay` and `code-bytes`, debug/trace logging, capture, debug layer, scripted keys, stack dumps, `VICTORY_AB` |
 
 `victory-shader` is always built with feature `host` (D3D12 pipeline checks for
 `translate --pipelines`). `warm` and `run` need Windows; on other targets `run`
@@ -166,6 +170,7 @@ Empty env values count as unset. Unknown keys in the file are an error
 | pre-build driver pipelines | one run with `VICTORY_PIPELINE_BOOK=1`, then `victory warm` (or `--used`) |
 | bind without running | `victory run <exe>` |
 | play | `scripts\play.ps1 -Exe <exe>` (diag build) or `Play-VIctory.cmd pareto-residency` (release build, Series S) — see [repo-tooling.md](../reference/repo-tooling.md#launch-scripts) |
+| which title code writes some title memory | diag build: `VICTORY_WRITERS=<address>+<len>` or `VICTORY_WRITERS_OF=<shader>:s<slot>+<offset>` with `VICTORY_WRITERS_FROM`/`_FOR` ([victory-gpu-memory.md](victory-gpu-memory.md) §3.4a); then `victory code-bytes <image> <rva> <len>` and a disassembler |
 | debug a frame | run with `VICTORY_RECORD=<dir>` (diag), then `victory replay <dir> …` ([docs/replay.md](../replay.md)) |
 
 ## Recipes

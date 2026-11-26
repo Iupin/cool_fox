@@ -542,7 +542,32 @@ fn delete(root: &Path, name: &str) -> HRESULT {
 }
 
 /// Reads the named blobs (all of them for `None`) of a container.
+/// Every read is said aloud (`game save: blob read`, or a warning when it
+/// fails): the title falls back to defaults for what it cannot read, and
+/// says nothing.
 fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
+    let asked = names.clone();
+    let result = read_unlogged(c, names);
+    match &result {
+        Ok(blobs) => {
+            for (name, data) in blobs {
+                tracing::info!(container = c.name, blob = name, size = data.len(), "game save: blob read");
+            }
+            if blobs.is_empty() {
+                tracing::info!(container = c.name, ?asked, "game save: read of no blobs");
+            }
+        }
+        Err(hr) => tracing::warn!(
+            container = c.name,
+            ?asked,
+            hr = format_args!("{:#010x}", *hr as u32),
+            "game save: a read failed"
+        ),
+    }
+    result
+}
+
+fn read_unlogged(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
     let _saves = saves_lock();
     let version = current_named(&c.dir, &c.name)
         .map_err(|e| io_error(&c.dir, &e))?
@@ -630,6 +655,11 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
             })
             .collect()
     };
+    tracing::info!(
+        found = infos.len(),
+        containers = ?infos.iter().map(|i| (i.0.to_string_lossy().into_owned(), i.2, i.3)).collect::<Vec<_>>(),
+        "game save: containers reported"
+    );
     for (name, display, blob_count, total_size, last_modified) in &infos {
         let info = ContainerInfo {
             name: name.as_ptr(),
@@ -668,6 +698,15 @@ extern "system" fn initialize_async(
     } else {
         Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
     };
+    match &result {
+        Ok(_) => tracing::info!(config = text(config), saves = %saves.display(), "game save: provider opened"),
+        Err(hr) => tracing::warn!(
+            config = text(config),
+            saves = %saves.display(),
+            hr = format_args!("{:#010x}", *hr as u32),
+            "game save: the provider could not be opened"
+        ),
+    }
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -812,6 +851,7 @@ extern "system" fn read_blobs(
     };
     let bytes = layout(&blobs, out as usize);
     if out.is_null() || size < bytes.len() {
+        tracing::warn!(container = c.name, size, needed = bytes.len(), "game save: a blob read's buffer is too small");
         return BUFFER_TOO_SMALL;
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
@@ -846,9 +886,11 @@ extern "system" fn read_result(
     // The documented error for a small buffer; the result stays for a
     // retry with a larger one.
     if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
+        tracing::warn!(size, "game save: an asynchronous blob read's buffer is too small");
         return BUFFER_TOO_SMALL;
     }
     if hr < 0 {
+        tracing::warn!(hr = format_args!("{:#010x}", hr as u32), "game save: an asynchronous blob read's result failed");
         return hr;
     }
     // The first name follows the blob array, so its offset gives the count.

@@ -261,10 +261,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
 /// rest of the run at first.
 ///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
+/// And only while [`builder_asked`] (on unless `VICTORY_BVH_BUILDER=0`;
+/// it was off by default until 2026-11-26).
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
@@ -332,12 +330,27 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether the title's ray tracing is asked for: on unless
+/// `VICTORY_BVH_BUILDER=0`. The title always traces rays (on the console it
+/// is not a setting). Without it (2026-11-26) about two launches in three
+/// came out posterised for their whole session, and the layer leaves out
+/// the programs that resolve and activate rays (`make.rs`), whose images
+/// then hold what their memory held.
+pub(crate) fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| asked_from(std::env::var_os("VICTORY_BVH_BUILDER").as_deref()))
+}
+
+/// [`builder_asked`] from the variable's value.
+fn asked_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -527,12 +540,36 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        let why = skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| make::missing(&p.host));
+        if why.as_deref() == Some("being made") {
+            note_first_wait_drop(p);
+        }
+        why
     };
     if let Some(why) = why {
         note_why(why);
+    }
+}
+
+/// Names each pipeline the first time one of its draws or dispatches is
+/// dropped because its host pipeline is still being made (diagnostics): a
+/// pass the title runs once is lost for the run.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_first_wait_drop(p: &Pipeline) {
+    static NAMED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let hashes = make::hashes(&p.host);
+    let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if named
+        .get_or_insert_with(Default::default)
+        .insert(hashes.clone())
+    {
+        tracing::info!(
+            shaders = %hashes,
+            frame = crate::frame::current(),
+            "dropped: its host pipeline is being made (first drop of this pipeline)"
+        );
     }
 }
 
@@ -808,6 +845,16 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// Ray tracing is on unless `VICTORY_BVH_BUILDER=0`.
+    #[test]
+    fn ray_tracing_is_on_unless_turned_off() {
+        use std::ffi::OsStr;
+        assert!(super::asked_from(None));
+        assert!(super::asked_from(Some(OsStr::new("1"))));
+        assert!(super::asked_from(Some(OsStr::new(""))));
+        assert!(!super::asked_from(Some(OsStr::new("0"))));
     }
 
     use super::*;

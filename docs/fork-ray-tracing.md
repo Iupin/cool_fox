@@ -1,10 +1,16 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
+Status, 2026-11-26: **on by default** (`VICTORY_BVH_BUILDER=0` turns it
+off). Without it about two launches in three came out posterised for their
+whole session (15 good of 47 unattended launches; with the builder on 9 of
+9: `docs/bug-journal.md`, 2026-11-26), and the title always traces rays.
+Measured on the RTX 3080 10 GB machine (Ryzen 9 5900X, 32 GB, release build, stock launcher) in the prologue's opening scene: 100 to 108 ms a frame (9 to 10 fps) with ray tracing on, of which some 66 ms is preparing on the CPU and 14 to 17 ms on the card, against 67 to 70 ms (14 to 15 fps) with it off: about a third of the frame rate. The card held about 8.5 GB of a 9.0 GB budget and the process about 20 GB. In the playable open world the frame rate was 8 to 12 fps as seen in play (not taken from the log). Long sessions were not measured; one launch ended with the PC's memory 98 % in use.
+
+2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
 indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
-card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
-default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
-for next to nothing (below).
+card's time a frame (the dorm, RX 7900 XTX: 75 of 90 ms busy against 34 of
+64). **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
+for next to nothing (below); it applies only while the builder does not run.
 
 ## What the title does
 
@@ -58,7 +64,7 @@ shaders and emulates the one instruction.
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
-   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
+   none run (on unless `VICTORY_BVH_BUILDER=0`; `VICTORY_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
@@ -91,13 +97,13 @@ after it was given them as an unordered access view.
 
 | variable | does |
 |---|---|
-| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_BUILDER=0` | the builder's stages are dropped and the ray-resolve and ray-activation programs left out (`VICTORY_RT_RESOLVE=1`, `VICTORY_ACTIVATE_RAYS=1` keep those); unset or anything else: ray tracing on, the default since 2026-11-26 |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
-| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096); a page goes on the card only while the card's use stays under 97 % of its budget, so a smaller card gets less (`shadow::by_address`) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
@@ -160,7 +166,9 @@ fork's constant.
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 
-It is off while the builder runs.
+It is off while the builder runs, so the launchers' `VICTORY_AMBIENT=0.8` and
+`VICTORY_AMBIENT_AIR=1.5` only take effect with `VICTORY_BVH_BUILDER=0` or when
+the builder cannot be made.
 
 ## Where to look
 

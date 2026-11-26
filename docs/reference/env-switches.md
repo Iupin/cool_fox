@@ -9,10 +9,10 @@ explained in a comment where it is read, and this page quotes that comment.
 
 | set | count | how |
 |---|---:|---|
-| distinct `VICTORY_*` names anywhere in tracked files | **348** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
-| distinct names in `.rs` files (code and comments) | 347 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
-| distinct names as a string literal `"VICTORY_..."` in `.rs` | 346 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
-| **read by product code** (tables below) | **316** | literal outside test modules/files, not only a `.env()` set or `==` compare |
+| distinct `VICTORY_*` names anywhere in tracked files | **354** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
+| distinct names in `.rs` files (code and comments) | 353 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
+| distinct names as a string literal `"VICTORY_..."` in `.rs` | 352 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
+| **read by product code** (tables below) | **322** | literal outside test modules/files, not only a `.env()` set or `==` compare |
 | of those, build-time `env!` values (not user settings) | 3 | `VICTORY_TRANSLATOR`, `VICTORY_SHADER_SOURCE_HASH`, `VICTORY_SHADER_SWITCHES` |
 | of those, set by `victory` itself for its own child processes | 2 | `VICTORY_AUDIO_CAPTURE_OF`, `VICTORY_RELAUNCHED_FROM` |
 | read only by tests / benchmarks / test child processes | 30 | [Test-only](#test-only-and-child-process-names) |
@@ -21,7 +21,10 @@ explained in a comment where it is read, and this page quotes that comment.
 | set by a launcher | 28 | [Launcher summary](#what-the-launchers-set) |
 | other (non-`VICTORY_`) variables read | 7 (4 by product code) | [Other variables](#other-variables) |
 
-316 + 30 + 1 = 347 names in `.rs`; + 1 doc-only = 348.
+322 + 30 + 1 = 353 names in `.rs`; + 1 doc-only = 354. (The six
+`VICTORY_WRITERS*` names were added on 2026-11-26 without re-running the
+classification; `crates/victory-gpu/src/writers.rs` counts once it is
+tracked.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -112,7 +115,7 @@ effect (exceptions: `VICTORY_AB` phases).
 | `VICTORY_SKIP_PIPELINES` | `none` (not a 16-digit hash: a diag build logs a warning and skips nothing) | – |
 | `VICTORY_UNDER_WIDE` | `0` (`-Safe` only) | – |
 | `VICTORY_LAND_ECHO` | `0` (`-Safe` only) | – |
-| `VICTORY_BVH_BUILDER` | `1` (`-RayTracing` only) | – |
+| `VICTORY_BVH_BUILDER` | `0` (`-NoRayTracing` only; on by default since 2026-11-26) | – |
 | `VICTORY_AMBIENT_AIR` | – | `1.5` |
 | `VICTORY_LEVELS_ON_DEMAND` | – | `1` |
 | `VICTORY_CARD_BUFFERS_MIN_KB` | – | `64` |
@@ -157,7 +160,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_HOST_RDNA` | `apps/victory/src/translate.rs:254` | true only if `1` | `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`). | neither |
 | `VICTORY_HOST_WAVE` | `apps/victory/src/main.rs:208` | integer lanes (e.g. `32`) | `translate`: translate as for a GPU whose waves are at most this many lanes (`set_host_max_wave`). Same effect as `VICTORY_HOST_MAX_WAVE`. | neither |
 | `VICTORY_PAIRS` | `apps/victory/src/translate.rs:267` | `vs+ps,...` label substrings | translate: shaders named here are kept and built into host pipelines as vertex+pixel pairs after the walk (translate.rs:148). | neither |
-| `VICTORY_POKE` | `apps/victory/src/run.rs:263` | `<rva>:<byte>,...` hex; unset = off; diag build | `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at each title+rva twice a second. | neither |
+| `VICTORY_POKE` | `apps/victory/src/run.rs:269` | `<rva>:<byte>,...` hex; unset = off; diag build | `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at each title+rva twice a second. Code pages (execute-read) are made execute-read-write at start so an instruction byte can be patched; a `VIctory: poke title+<rva>: page protection was ...` line says which. | neither |
 | `VICTORY_SHADER_CENSUS` | `apps/victory/src/translate.rs:642`, `crates/victory-shader/src/emit/bitcode/census.rs:63` | path; unset = off | `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended: its label, the console program's instructions by encoding class (a static count of the whole program, not of one thread's path), and the host module's ... | neither |
 | `VICTORY_SKIP_CPU_CHECK` | `apps/victory/src/run.rs:8` | only `1` skips | `victory run --execute` refuses a CPU without AVX2 unless this is `1` (for CPU emulators such as Intel SDE). | neither |
 | `VICTORY_TRANSLATE_ONLY` | `apps/victory/src/translate.rs:475` | `<hash prefix>,...`; unset = all | `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates those containers alone. | neither |
@@ -407,27 +410,27 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
-| `VICTORY_ACTIVATE_RAYS` | `crates/victory-gpu/src/pipeline/make.rs:77`, `crates/victory-gpu/src/pipeline/make.rs:79` | with `VICTORY_BVH_BUILDER=1`: true only if `0`; else true if unset or `0` | module: | neither |
-| `VICTORY_BVH_BUILDER` | `crates/victory-gpu/src/pipeline.rs:333`, `crates/victory-gpu/src/pipeline/make.rs:62`, `crates/victory-gpu/src/pipeline/make.rs:75` | true only if `1` | At a dispatch of a builder pipeline: whether the builder runs (see [`Builder`]). | play.ps1=`1 (-RayTracing)` |
-| `VICTORY_BVH_QUARANTINE` | `crates/victory-gpu/src/pipeline.rs:307` | true only if `1` | `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store stays in the host's copies and is not copied back into title memory. | neither |
+| `VICTORY_ACTIVATE_RAYS` | `crates/victory-gpu/src/pipeline/make.rs:78`, `crates/victory-gpu/src/pipeline/make.rs:80` | with ray tracing on (the default): left out only if `0`; with `VICTORY_BVH_BUILDER=0`: left out if unset or `0` | Whether the title's `CS_ScreenProbes_ActivateRays` programs are left out (their dispatches dropped). Not needed with the builder on: they run anyway. With the builder off, leaving them and the resolve programs out left their images unwritten, and about two launches in three posterised (2026-11-26, `docs/bug-journal.md`). | neither |
+| `VICTORY_BVH_BUILDER` | `crates/victory-gpu/src/pipeline.rs:341` (`builder_asked`, also read through it at `pipeline/make.rs:62`, `pipeline/make.rs:77`) | on unless `0` (off by default until 2026-11-26) | The title's ray tracing: its structure builder's stages run (see [`Builder`]) and the programs that activate and resolve rays are kept. `0`: off; the builder's stages are dropped, the resolve and activation programs left out, and `VICTORY_AMBIENT` stands in for the indirect light. | play.ps1=`0 (-NoRayTracing)` |
+| `VICTORY_BVH_QUARANTINE` | `crates/victory-gpu/src/pipeline.rs:312` | true only if `1` | `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store stays in the host's copies and is not copied back into title memory. | neither |
 | `VICTORY_EARLY_ALL` | `crates/victory-gpu/src/pipeline/library.rs:768` | true only if `1` | `VICTORY_EARLY_ALL=1`: every title pipeline is started at creation, requested before or not, so that the driver's own cache holds it for later runs. | neither |
 | `VICTORY_LIBRARY_HANDLE` | `crates/victory-gpu/src/pipeline/library.rs:95` | true unless `0` | `VICTORY_LIBRARY_HANDLE=0` closes it after mapping, as before. | neither |
 | `VICTORY_LIBRARY_LOCK` | `crates/victory-gpu/src/pipeline/library.rs:432` | true only if `1` | With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before. | neither |
 | `VICTORY_LIBRARY_MAP` | `crates/victory-gpu/src/pipeline/library.rs:86` | true unless `0` | `VICTORY_LIBRARY_MAP=0` uses buffers, as before. | neither |
 | `VICTORY_LIBRARY_TRIM` | `crates/victory-gpu/src/pipeline/library.rs:375` | true unless `0` | `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them. | neither |
 | `VICTORY_PIPELINE_BOOK` | `crates/victory-gpu/src/pipeline/known.rs:43` | true only if `1` | `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept. | neither |
-| `VICTORY_PIPELINE_LOWEST` | `crates/victory-gpu/src/pipeline/make.rs:508` | true unless `0` | Below the title's own threads (loading, recording), and the streaming one, which is below normal itself (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before). | neither |
-| `VICTORY_PIPELINE_SLOW` | `crates/victory-gpu/src/pipeline/make.rs:355` | true only if `0` | `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before. | neither |
-| `VICTORY_PIPELINE_WAIT_MS` | `crates/victory-gpu/src/pipeline/make.rs:189` | u64; default `500` | Waiting allowed per title frame, over all threads. | neither |
-| `VICTORY_PIPELINE_WAIT_SHARED` | `crates/victory-gpu/src/pipeline/make.rs:272` | true unless `0` | `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before. | neither |
-| `VICTORY_PIPELINE_WORKERS` | `crates/victory-gpu/src/pipeline/make.rs:492` | number | `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to 64), else two thirds of the logical processors, 2 to 16. | neither |
+| `VICTORY_PIPELINE_LOWEST` | `crates/victory-gpu/src/pipeline/make.rs:514` | true unless `0` | Below the title's own threads (loading, recording), and the streaming one, which is below normal itself (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before). | neither |
+| `VICTORY_PIPELINE_SLOW` | `crates/victory-gpu/src/pipeline/make.rs:361` | true only if `0` | `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before. | neither |
+| `VICTORY_PIPELINE_WAIT_MS` | `crates/victory-gpu/src/pipeline/make.rs:195` | u64; default `500` | Waiting allowed per title frame, over all threads. | neither |
+| `VICTORY_PIPELINE_WAIT_SHARED` | `crates/victory-gpu/src/pipeline/make.rs:278` | true unless `0` | `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before. | neither |
+| `VICTORY_PIPELINE_WORKERS` | `crates/victory-gpu/src/pipeline/make.rs:498` | number | `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to 64), else two thirds of the logical processors, 2 to 16. | neither |
 | `VICTORY_LINEAR_SAMPLERS` | `crates/victory-gpu/src/pipeline/host.rs:422` | `<16-hex shader hash>,...`; unset = off | An experiment: the static samplers of the listed shaders filter linearly in min, mag and mip (`D3D12_FILTER` 0x15), whatever the console's sampler words say; reduction and comparison bits are kept. Read when a host pipeline is made. | neither |
 | `VICTORY_ROOT_LOG` | `crates/victory-gpu/src/pipeline/host.rs:429` | `<16-hex shader hash>,...`; unset = off | For pipelines of the listed shaders: an info line when the host root signature is made (object, blob fingerprint, every static sampler's filter, register, space, visibility) and, in diagnostics builds, a `BIND` line in a captured frame's ops listing saying whether the root signature and pipeline were set or already set. | neither |
 | `VICTORY_ROOT_SRV_DIRECT` | `crates/victory-gpu/src/pipeline/host.rs:355` | set (any value) = root descriptors | `VICTORY_ROOT_SRV_DIRECT=1` goes back to root descriptors. | neither |
-| `VICTORY_RT_RESOLVE` | `crates/victory-gpu/src/pipeline/make.rs:68` | `1` (any non-`0`) keeps RT-resolve shaders; default skip | Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1. | neither |
-| `VICTORY_SCREEN_WAIT_MS` | `crates/victory-gpu/src/pipeline/make.rs:203` | number; default `10_000` | As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`, 10 s; 0: like the others). | neither |
+| `VICTORY_RT_RESOLVE` | `crates/victory-gpu/src/pipeline/make.rs:70` | only read with `VICTORY_BVH_BUILDER=0`: `1` (any non-`0`) keeps the `CS_RaytracingResolve` programs; default: left out | With the builder off, ~1,000 resolve programs shade no hits while clogging the cold compiler queue. Left out, what they write is never written (see `VICTORY_ACTIVATE_RAYS`). With the builder on they always run. | neither |
+| `VICTORY_SCREEN_WAIT_MS` | `crates/victory-gpu/src/pipeline/make.rs:209` | number; default `10_000` | As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`, 10 s; 0: like the others). | neither |
 | `VICTORY_SHADER_SAVE` | `crates/victory-gpu/src/pipeline.rs:154` | path; unset = off | `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as translated (`.dxil`), by the hash crash reports name it with | neither |
-| `VICTORY_SKIP_PIPELINES` | `crates/victory-gpu/src/pipeline.rs:498` | `<16-hex hash>,...`; anything else warned and ignored; diag build | Omit draws/dispatches whose pipeline contains a listed shader hash. | play.ps1=`none` |
+| `VICTORY_SKIP_PIPELINES` | `crates/victory-gpu/src/pipeline.rs:518` | `<16-hex hash>,...`; anything else warned and ignored; diag build | Omit draws/dispatches whose pipeline contains a listed shader hash. | play.ps1=`none` |
 
 ### victory-gpu / pool (2)
 
@@ -591,6 +594,22 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_PAGE_WRITES` | `crates/victory-gpu/src/watch.rs:2116` | one of `0`, `1`, `slots`; else default arm | What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do not see once its bytes are there ([`title_memory_written`]), as bits: 1, the guarded blocks under it are opened and count as written (host copies of buffers ... | neither |
 | `VICTORY_TAKE_PARTS` | `crates/victory-gpu/src/watch.rs:787` | default ON; `0` off | Of a page taken before, the parts written since, where they are known (`VICTORY_TAKE_PARTS=0`: the page). | neither |
 | `VICTORY_VIEW_GUARD` | `crates/victory-gpu/src/watch.rs:1809` | true unless `0` | Whether all the views of a guarded page are guarded together (`VICTORY_VIEW_GUARD`). | neither |
+
+### victory-gpu / writers (6)
+
+The writers watch (`docs/crates/victory-gpu-memory.md` §3.4a). Read once, by
+`writers_from_env`, which only diagnostics builds call
+(`victory_hle::watch_writers`, from `apps/victory/src/run.rs` `diagnostics`);
+a release build never reads them.
+
+| name | where read | values & default | effect (from the read-site comment) | launcher |
+|---|---|---|---|---|
+| `VICTORY_WRITERS` | `crates/victory-gpu/src/writers.rs:398` | `<hex address>+<hex length>,...` (title addresses, `0x` optional, each at most 64 KiB); unset = off; diag build | Keeps the 4 KiB pages of each range read-only during the window and names every write into them: instruction as `module+rva`, offset, size, values, thread, frame, stack; a table every 10 s while something is new, at the window's end and at exit; the range's first 256 words when its watch starts and ends. | neither |
+| `VICTORY_WRITERS_OF` | `crates/victory-gpu/src/writers.rs:418` | `<16-hex shader hash>:s<slot>+<dword offset>,...`; unset = off; diag build | For draws whose pipeline has that shader, the title memory of the table view at that binding (a constant view or a placed buffer view, as the ops listing names it) is watched as `VICTORY_WRITERS` would, up to 4 distinct addresses per binding. | neither |
+| `VICTORY_WRITERS_FROM` | `crates/victory-gpu/src/writers.rs:467` | seconds (f64) after the title starts; default 0; diag build | When the watch's window opens: before it nothing is read-only. | neither |
+| `VICTORY_WRITERS_FOR` | `crates/victory-gpu/src/writers.rs:468` | seconds (f64); default: to the end; diag build | How long the window stays open; at its end the table and the words are told and the pages are let go. | neither |
+| `VICTORY_WRITERS_DETAIL` | `crates/victory-gpu/src/writers.rs:469` | number; default 64; diag build | Writes of each (instruction, offset) noted with a stack; later ones are counted, with their values. | neither |
+| `VICTORY_WRITERS_STACK` | `crates/victory-gpu/src/writers.rs:470` | number; default 12, at most 32; diag build | Frames of each stack noted. | neither |
 
 ### victory-hle (3)
 

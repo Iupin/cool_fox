@@ -1468,6 +1468,10 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::writers::looking() {
+            self.writers_of(p);
+        }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
@@ -4008,6 +4012,32 @@ impl State {
         out
     }
 
+    /// `VICTORY_WRITERS_OF` (diagnostics builds): the title memory of the
+    /// table views it names, for the writers watch
+    /// (`crate::writers::bound`), named by shader hash and `s<slot>+<dword
+    /// offset>` as [`State::reads`] lists them.
+    #[cfg(feature = "diagnostics")]
+    fn writers_of(&self, p: &HostPipeline) {
+        for stage in &p.stages {
+            let hash = &stage.shader.hash;
+            if !crate::writers::shader_wanted(hash) {
+                continue;
+            }
+            for u in &stage.translated().used {
+                if u.root != RootType::Table || !crate::writers::binding_wanted(hash, u.slot, u.table_offset_dwords) {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(p.compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                if let Some((address, size)) = view_range(view.as_ref()) {
+                    crate::writers::bound(hash, u.slot, u.table_offset_dwords, address, size);
+                }
+            }
+        }
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -4861,16 +4891,7 @@ fn constants_wanted(hash: &str) -> bool {
 /// views or memory that is not committed.
 #[cfg(feature = "diagnostics")]
 fn view_words(view: Option<&View>) -> Option<String> {
-    let (address, size) = match view? {
-        View::Constant(address, size) => (*address, u64::from(*size)),
-        // A buffer (resource dimension 1): its title address and width in
-        // bytes, as `describe` reads them.
-        View::Placed(_, r, d) if r[0] == 1 => (
-            u64::from(d[10]) | u64::from(d[11]) << 32,
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-        ),
-        _ => return None,
-    };
+    let (address, size) = view_range(view)?;
     let len = size.min(4096) as usize & !3;
     if address == 0 || len == 0 || !crate::texture::committed(address as *const u8, len) {
         return None;
@@ -4878,6 +4899,22 @@ fn view_words(view: Option<&View>) -> Option<String> {
     // SAFETY: `len` committed bytes of title memory.
     let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
     Some(words_text(bytes))
+}
+
+/// The title memory a constant view or a placed buffer view reads: its
+/// address and bytes; none for other views.
+#[cfg(feature = "diagnostics")]
+fn view_range(view: Option<&View>) -> Option<(u64, u64)> {
+    match view? {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        // A buffer (resource dimension 1): its title address and width in
+        // bytes, as `describe` reads them.
+        View::Placed(_, r, d) if r[0] == 1 => Some((
+            u64::from(d[10]) | u64::from(d[11]) << 32,
+            u64::from(r[4]) | u64::from(r[5]) << 32,
+        )),
+        _ => None,
+    }
 }
 
 /// Little-endian 32-bit words as ` words [0x........ ...]`.

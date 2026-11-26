@@ -29,6 +29,15 @@ pub use victory_gpu::replay;
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
 
+/// Debugging aid: the writers watch (`VICTORY_WRITERS`, `VICTORY_WRITERS_OF`
+/// and the rest, `docs/crates/victory-gpu-memory.md`) names the title code
+/// that writes ranges of title memory, as `module+rva` with the loader's
+/// names and stacks. Its time window counts from this call.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn watch_writers() {
+    victory_gpu::writers_from_env(victory_loader::locate, victory_loader::unwind_here);
+}
+
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 

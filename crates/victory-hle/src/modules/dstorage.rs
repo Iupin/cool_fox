@@ -150,7 +150,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name: kept.clone() });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -278,6 +278,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// The title's path, for `reads`.
+    name: String,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -1421,7 +1423,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")).inspect(|&n| {
+            if n < out.len() {
+                short_of_destination(request, n, out.len());
+            }
+        }),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1547,9 +1553,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .files;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let files = &file.files;
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
@@ -1584,7 +1589,33 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    super::reads::note_named(
+        "dstorage",
+        || file.name.clone(),
+        || files.first.metadata().ok().map(|m| m.len()),
+        out.len() as u64,
+        done as u64,
+        result.is_err(),
+    );
     result
+}
+
+/// A compressed request that filled less of its destination than it names
+/// (the title's chunks fill theirs exactly): the rest keeps what was there.
+fn short_of_destination(request: &Request, wrote: usize, destination: usize) {
+    static SHORT: AtomicU64 = AtomicU64::new(0);
+    if let Some(n) = super::reads::tell(&SHORT) {
+        tracing::warn!(
+            n,
+            options = format_args!("{:#x}", request.options),
+            offset = request.offset,
+            source_size = request.source_size,
+            destination_size = destination,
+            wrote,
+            name = text(request.name),
+            "dstorage: a request completed with less data than its destination holds"
+        );
+    }
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how

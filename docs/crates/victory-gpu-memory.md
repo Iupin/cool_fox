@@ -139,7 +139,8 @@ return or make a copy. A 1024-entry hash cache sits in front of them (`FOUND`,
   never under it.
 - `GUARDS: Mutex<Guards>` (`watch.rs:1364-1426`): `protected`, `clean`,
   `absent` (wholly uncommitted, copied as zeros), `held` (placeholders),
-  `foreign`, `kernel` (ranges the kernel is writing now), `changing` (mid-remap),
+  `foreign`, `kernel` (ranges the kernel is writing now), `kept` (ranges an
+  overlapped read may still land in, with a deadline), `changing` (mid-remap),
   `aliased`, and `opened` (rest timestamps).
 - Lock-free bitmaps `PUBLISHED`, `PROTECTED` and `BESIDE` (`watch.rs:951-969`),
   read by the fault handler without the lock.
@@ -152,12 +153,24 @@ return or make a copy. A 1024-entry hash cache sits in front of them (`FOUND`,
 
 These are re-exported from `lib.rs`: `title_memory_allocated`, `_freed`,
 `_remapping`, `_remapped`, `_unmapping`, `_splitting`, `_reading`, `_written`,
-`kernel_writing`, and `writing` (exported as `kernel_will_write`). The rules:
+`_guarded` (with `Guarded`), `kernel_writing` (with `KernelWrite`), and
+`writing` (exported as `kernel_will_write`). The rules:
 
 - Before the kernel writes title memory (a file read), call `kernel_writing`.
   It opens the guarded blocks and keeps them open until it is dropped. A kernel
-  write into a read-only page does not fault into our handler: it fails, and the
-  read comes back short (`watch.rs:2061-2067`).
+  write into a read-only page does not fault into our handler: it fails
+  (`ERROR_NOACCESS` or `ERROR_INVALID_USER_BUFFER`), and the read is lost
+  (`kernel_writing`'s comment).
+- A read that goes on after its call (overlapped, `ERROR_IO_PENDING`) hands
+  its `KernelWrite` to `keep_for(time)`: the blocks stay left alone (never
+  guarded, told as written at every asking) until the deadline, then are
+  guarded at the next refresh, which counts them written. The kernel has
+  locked the pages by then, so a late guard would not stop the write, but a
+  refresh that made the block clean before the bytes landed would keep the
+  old bytes in every copy (`a_kernel_write_kept_past_its_call_stays_open_until_its_time_is_up`).
+- `title_memory_guarded(at, len) -> Guarded { blocks, read_only, other_views }`
+  says how a failed read's destination is guarded, for the runtime's
+  warnings (takes the guards' lock; for reports only).
 - DirectStorage writes physical pages through the runtime's own view, so the
   guards do not see it. The runtime reports it with `title_memory_written(..,
   pages = true)`. What happens next is set by `VICTORY_PAGE_WRITES`
@@ -212,6 +225,110 @@ ahead of the crash reporter's. For a write access violation at `at`:
 `titlewrite::import` replaces the title's `memcpy`, `memmove` and `memset`
 (`VICTORY_COPY_BESIDE`, off by default). The replacements write guarded parts
 "beside" without faulting.
+
+### 3.4a Who writes a range: the writers watch (`writers.rs`, diagnostics)
+
+Added 2026-11-26 to find the title routine that leaves default values in a
+scene-constant block in some launches. `VICTORY_WRITERS=<hex address>+<hex
+length>,...` (title addresses) and/or `VICTORY_WRITERS_OF=<16-hex shader
+hash>:s<slot>+<dword offset>,...` (a table view of a shader, named as the ops
+listing names it) start it. The switches are read only in diagnostics builds
+(`victory_hle::watch_writers`, called from `apps/victory/src/run.rs`
+`diagnostics`); with them unset nothing is armed and every hook below is one
+atomic load.
+
+How it works:
+
+1. The 4 KiB pages holding each range are made read-only for the time window
+   (`VICTORY_WRITERS_FROM` seconds after the title starts, for
+   `VICTORY_WRITERS_FOR` seconds; default: from the start to the end).
+   Outside the window this facility leaves the pages as it found them. A
+   range none of whose pages is there yet (not committed) is tried again
+   every 100 ms while the window is open (`none of the N pages ... can be
+   watched yet`, said at the 1st, 2nd, 4th... try). Code is named as the
+   loader maps it: the title's executable is the prepared copy
+   `victory-image-<hash>.dll`, whose rvas are the original executable's.
+2. A write into such a page faults into `watch::install`'s handler, which
+   hands it to `writers::on_exception` first. Under the guards' lock
+   (`watch::writer_opens`) the 64 KiB block is opened exactly as the guards'
+   own fault path would (`open`, `Guards::opened`, the fault book), so the
+   journal and every host copy still see the write; then the 4 KiB page is
+   made writable. The write is noted (below), the trap flag is set, and the
+   thread goes on. The instruction runs unchanged; the single-step exception
+   after it reads the bytes written, makes the page read-only again and
+   clears the flag. A `rep movs`/`rep stos` is stepped until its `rip`
+   moves on (one trap per element), and is noted once with the bytes it
+   covered. An instruction that faults again in another watched page (a
+   store across pages) adds that page to the step.
+3. Noted per (instruction, offset in the range): count, first and last
+   frame and time, size (`titlewrite::store_extent`, the store decoder of
+   the title-write emulation; `?` where it does not decode), the first four
+   distinct values and the last, how often the value changed, the first and
+   last thread, and for the first `VICTORY_WRITERS_DETAIL` (64) writes a
+   stack of `VICTORY_WRITERS_STACK` (12, at most 32) frames through the
+   loader's `unwind_here`, of which the first is kept and the others are
+   counted when different. Past the detail only counts and values are kept.
+   Writes elsewhere in a watched page are counted per instruction only.
+   Code is named with the loader's `locate` (`module+0xrva`).
+4. Coexistence: the guards' `unguard` calls `writers::reguard` for each block
+   it makes writable, which makes the watched pages in it read-only again
+   (not those being stepped or written by the kernel). `kernel_writing`
+   holds the watched pages open for the kernel (`writers::kernel_begin`
+   before the blocks open, `kernel_open` under the lock) and notes the write
+   as `kernel`, with the first caller outside our image as its instruction,
+   when the `KernelWrite` is dropped (`keep_for`: when its time is up).
+   Writes told after the fact are noted as told: `kernel_will_write` as
+   `kernel (told after)`, DirectStorage page writes
+   (`title_memory_written(.., true)`) as `kernel (page write)`, landings
+   beside the guards (`landed_beside`) as `gpu (landed)`. A landing that
+   writes the title address itself faults like any write and is named by its
+   `safecopy` instruction in our image. `title_memory_remapped` re-arms
+   watched pages there. Other views of a watched page (`inplace::
+   shown_elsewhere`, at arming) are watched too and their writes noted at
+   the range's offset.
+5. `VICTORY_WRITERS_OF`: `draw.rs` `State::writers_of` (from `prepare_for`,
+   diagnostics builds, while `writers::looking()`) reads the view at the
+   named binding of each draw whose pipeline has that shader, as
+   `view_words` does (`view_range`: a constant view, or a placed buffer
+   view), and `writers::bound` takes up to 4 distinct addresses per binding
+   (double-buffered blocks show at two), each a range of its own, armed when
+   the window opens.
+
+Output (info level, all lines start with `writers:`): `watch asked for`;
+`<binding> #n is title memory <address>+<len>`; `watching <range> at ...:
+N of M pages read-only (K at other views)`; `words of <range> ... at the
+start of its watch` and `... at the window's end` followed by 8 words a line
+(the first 256 words); `new writer <code> (<kind>) <range>+<offset> xN size S
+... values [...] last ... thread ... stack [a < b < ...]` the first time each
+(instruction, offset) has a value; `table at 10 s` every 10 s while something
+new came, `table at the window's end` and `table at exit` (the title's `exit`,
+`TerminateProcess` of itself, a suspend's end), with one row per writer and
+the busiest 16 instructions that wrote elsewhere in the pages. Values are
+shown as little-endian words with their meaning as floats.
+
+Cost: each write into a watched page is two exceptions and two
+`VirtualProtect`s (some 10-20 µs), past the detail limit too; a string store
+is one trap per element. A range written thousands of times a frame costs
+milliseconds a frame: use the window.
+
+Limits:
+
+- While one thread steps a write, the page is writable: another thread's
+  write to the same 4 KiB page in that moment is not seen.
+- Views of a watched page mapped after its range was armed are not watched;
+  writes through them are missed (the guards see them).
+- A kernel write into a watched page that does not come through
+  `kernel_writing` fails, as it would into a guarded block: a host API the
+  title calls directly with an output buffer there, or a future caller of
+  `kernel_will_write` ahead of its write (none exists: DirectStorage's
+  retries are inside `kernel_writing`, `xmem::pages_written` comes after the
+  bytes). Title calls of `VirtualProtect` on the page undo the watch.
+- Checks that ask Windows whether memory is read-write see the watched pages
+  as read-only (`inplace::private_whole`, used with `VICTORY_INPLACE` only).
+- With `VICTORY_STORE_BESIDE=1` a watched write is not emulated beside the
+  guards; it takes the path above.
+- At most 128 pages (views included), ranges of at most 64 KiB, 2048
+  writers and 512 instructions elsewhere; more are counted as not kept.
 
 ### 3.5 Card copies (two sides)
 
@@ -772,6 +889,9 @@ launcher sets, with the value it sets.
 | `VICTORY_SAME_RECORDS` | titlewrite.rs:185 | on | A titlewrite detail; not analysed further. |
 | `VICTORY_WRITE_SITES` | titlewrite.rs:273 | unset | A file for fault-site statistics. |
 | `VICTORY_FAULT_BOOK` / `_AT` | faultbook.rs:87-88 | unset / `150,210,270` | Binary log of write faults (diagnostics). |
+| `VICTORY_WRITERS` / `_OF` | writers.rs `Config::from_switches` | unset | The writers watch (§3.4a, diagnostics builds): `<hex address>+<hex length>,...`; `<shader hash>:s<slot>+<offset>,...`. |
+| `VICTORY_WRITERS_FROM` / `_FOR` | writers.rs `Config::from_switches` | 0 / to the end | Its window, seconds after the title starts. |
+| `VICTORY_WRITERS_DETAIL` / `_STACK` | writers.rs `Config::from_switches` | 64 / 12 (at most 32) | Writes per (instruction, offset) with a stack; frames per stack. |
 
 ### Textures
 
@@ -861,6 +981,16 @@ launcher sets, with the value it sets.
 
 - `watch::install::on_write`: it rewrites `Rip` (`fail`) and emulates title
   stores (`titlewrite::store`, decoding x86 in `titlewrite/decode.rs`).
+- `writers::on_exception`: sets and clears the trap flag of title threads,
+  holds per-thread step state across two exceptions, and changes 4 KiB page
+  protections inside the guards' 64 KiB blocks. Its ordering rules: a slot's
+  `stepping`/`kernel` count goes up before the guards open a block (so
+  `reguard` leaves the page writable), the page is made writable under the
+  guards' lock (no refresh can make the block clean in between), and a page
+  made read-only at the end of a step re-checks `live` and is given back
+  (`watch::writer_retired`) if the watch let it go meanwhile. The handler
+  takes the guards' lock and then the watch's state lock, never both at
+  once.
 - `safecopy.rs`: hand-written copy and merge routines whose faults are recovered
   by the handler.
 - `Shadow::data` raw mappings (`unsafe impl Send/Sync` on `Staging`,
@@ -912,6 +1042,7 @@ launcher sets, with the value it sets.
 | **Lost GPU writes in title memory** (physics wrong, objects vanish) | Is the writer's view declared? Try `VICTORY_PICKED_WRITES=2`. Is it a texture? Check its kind against `VICTORY_TEXTURE_BACK`. Run `victory replay --upcopies` on a capture. |
 | **Device removed** | Diagnostics build with `VICTORY_D3D12_DRED=light` (or `faults`) plus the address book. Then `VICTORY_SHOW_AFTER=1`, `VICTORY_RIPE_BLOCKS`, `VICTORY_WAIT_RESIDENT`, `VICTORY_KEEP_FREED`, `VICTORY_BURY_LAG`. Reproduce on a capture with `--debug-layer` or `VICTORY_REPLAY_GBV`. `VICTORY_SLOT_CHECK=1` finds slots that name freed memory before a loss. |
 | **Out of memory** | The `residency::refresh` warning line gives free physical memory, commit, mirrors and staging. Pool growth backs off 500 ms after a failure. Lower `VICTORY_SNAPSHOT_POOL` or `VICTORY_CARD_BUFFERS_MB`. `VICTORY_MEMORY_MAP=1` lists the big allocations. |
+| **Title memory holds the wrong values** (constants differ between launches) | Diagnostics build: `VICTORY_WRITERS=<address>+<len>` or `VICTORY_WRITERS_OF=<hash>:s<slot>+<offset>` with a `_FROM`/`_FOR` window (§3.4a) names each writing instruction as `module+rva` with values and a stack; `victory code-bytes <image> <rva> <len>` writes that code for a disassembler. |
 | **Frame stalls waiting** | The frame line's `waiting for landings: ...` spans name the reason (`relay_wait`, `host.rs:3360-3367`). Try `VICTORY_CARD_STEPS=2` and `VICTORY_RELAY_COPY=1`. |
 
 ---
@@ -929,7 +1060,8 @@ Do not run them while another build holds the target directory.
 
 | File | Tests (ignored) | Covers |
 |---|---|---|
-| `watch.rs` | 39 | The journal is shared by askers. Kernel reads into guarded blocks. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
+| `watch.rs` | 40 | The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
+| `writers.rs` | 12 | The writers watch on memory of the test's own: a write is told with its instruction, offset, size, value and count and is done; a write beside the range is counted only; a string store across two pages; a write through another view; a kernel read (`ReadFile`) refused while watched and landing under `kernel_writing`, told as the kernel's; the guards still report their block written; detail stops while counting goes on; the window arms and disarms; a range mapped after the window opened is watched then; a binding found by a draw is watched; switch parsing. |
 | `shadow.rs` | 33 (1) | Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |
 | `safecopy.rs` | 8 (1) | Every length and alignment. Only changed dwords are put. Faults become failures. |

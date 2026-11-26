@@ -145,12 +145,23 @@ cargo fmt --all -- --check       # not in CI (see below)
 - **Clippy, default features: passes** (exit 0).
 - **Clippy, `--all-features`: passes** (exit 0). The diag build has no
   compiler warnings.
-- **Tests: pass.** `cargo test --workspace --locked --no-fail-fast`: 944
+- **Tests: pass.** `cargo test --workspace --locked --no-fail-fast`: 967
   passed, 0 failed, 45 ignored over the unit and integration test binaries;
   the doc-test runs have no tests. `victory-shader` alone takes about 15
   minutes; everything else finishes in under a minute after the build.
 - **Policy: passes.** `asset policy: all files ok` (the count includes
   untracked files that are not ignored).
+- **Later the same day (kernel reads into title memory, see the bug
+  journal):** both clippy commands pass, `cargo test -p victory-hle --locked`
+  158 passed, 2 ignored; `cargo test -p victory-gpu --locked` 349 passed,
+  34 ignored; policy passes. The full workspace run was not repeated.
+- **Later still (the writers watch, see the bug journal):** both clippy
+  commands pass; `cargo test -p victory-gpu --locked` 361 passed, 34
+  ignored; `-p victory-hle` 158 passed, 2 ignored; `-p victory-loader` 43
+  passed; `-p victory` 12 passed (3 more, `code::tests`, with
+  `--features diagnostics`); `cargo test -p victory-gpu --features
+  diagnostics --locked --lib writers::` passes; policy passes (270 files).
+  The full workspace run was not repeated.
 
 How it got there, from a tree where `f4b48ad` itself fails CI (37 / 36
 clippy lints; 2 failing `victory-gpu` tests):

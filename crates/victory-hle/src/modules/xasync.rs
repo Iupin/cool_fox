@@ -662,6 +662,7 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
+        early_completion(block);
         // SAFETY: read before the status was published; see below.
         if let Some(routine) = unsafe { (*block).callback } {
             routine(block);
@@ -771,8 +772,62 @@ pub fn XAsyncGetResult(
     hr
 }
 
+/// Calls of ours that complete in their begin ([`finished_with`],
+/// [`pending_with`]) whose begin has not returned yet: block, the area's call
+/// site and the beginning thread.
+static BEGINNING: Mutex<Vec<(usize, &'static std::panic::Location<'static>, std::thread::ThreadId)>> =
+    Mutex::new(Vec::new());
+
+/// Completion routines of ours that ran before their begin returned.
+static EARLY: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// [`EARLY`], of this thread's routines.
+    static EARLY_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A call of ours on `block` is beginning (`Some`) or has begun (`None`).
+fn beginning(block: *mut AsyncBlock, at: Option<&'static std::panic::Location<'static>>) {
+    let mut list = lock(&BEGINNING);
+    match at {
+        Some(at) => list.push((block as usize, at, std::thread::current().id())),
+        None => {
+            if let Some(i) = list.iter().position(|e| e.0 == block as usize) {
+                list.swap_remove(i);
+            }
+        }
+    }
+}
+
+/// The completion routine of a call of ours runs before the title's async
+/// call that began it returned: on a console the work takes time and the
+/// routine comes later. A title that sets "pending" after its call returns
+/// overwrites the routine's "done" and waits for good, or takes the
+/// defaults; which comes first differs from launch to launch. Said aloud
+/// (the first 16, then every power of two), with the area's call site and
+/// whether it ran inline (an immediate completion port) or on another thread.
+fn early_completion(block: *mut AsyncBlock) {
+    let Some(&(_, at, thread)) = lock(&BEGINNING).iter().find(|e| e.0 == block as usize) else {
+        return;
+    };
+    #[cfg(test)]
+    EARLY_HERE.set(EARLY_HERE.get() + 1);
+    let n = EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(
+            n,
+            block = format_args!("{block:p}"),
+            area = %at,
+            inline = thread == std::thread::current().id(),
+            "async: a completion routine runs before the call that began it returned"
+        );
+    }
+}
+
 /// Starts a call on `block` that is already over: it completes with `hr`
 /// and no result data, through the block's completion port as usual.
+#[track_caller]
 pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
     finished_with(
         block,
@@ -783,6 +838,7 @@ pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) ->
 
 /// Like [`finished`], with the bytes `XAsyncGetResult` hands out for
 /// `identity` (an error has none).
+#[track_caller]
 pub fn finished_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
@@ -818,6 +874,7 @@ pub fn finished_with(
         S_OK
     }
     let context = Box::into_raw(Box::new(result));
+    beginning(block, Some(std::panic::Location::caller()));
     let hr = XAsyncBegin(
         block,
         context.cast(),
@@ -825,6 +882,7 @@ pub fn finished_with(
         std::ptr::null(),
         Some(provider),
     );
+    beginning(block, None);
     if hr < 0 {
         // Refused before the call existed, so no cleanup will come.
         // SAFETY: still ours.
@@ -835,6 +893,7 @@ pub fn finished_with(
 
 /// Like [`finished_with`], but the result comes from `work`, run on a
 /// thread of ours; the call stays pending until it returns (a dialog, say).
+#[track_caller]
 pub fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
@@ -880,7 +939,9 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
+    beginning(block, Some(std::panic::Location::caller()));
     let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    beginning(block, None);
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -1424,6 +1485,26 @@ mod tests {
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A call of ours over before its begin returns: its routine runs then
+    /// on an immediate completion port (and is told), later on a manual one.
+    #[test]
+    fn a_completion_before_its_begin_returned_is_told() {
+        extern "system" fn routine(_: *mut AsyncBlock) {}
+        let run = |completion: u32| {
+            let mut q = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(0, completion, &mut q), S_OK);
+            let mut block = AsyncBlock { queue: q, context: std::ptr::null_mut(), callback: Some(routine), internal: [0; 4] };
+            let before = EARLY_HERE.get();
+            assert_eq!(finished(&mut block, 0x78 as *const c_void, S_OK), S_OK);
+            let told = EARLY_HERE.get() > before;
+            while XTaskQueueDispatch(q, COMPLETION, 0) {}
+            XTaskQueueCloseHandle(q);
+            told
+        };
+        assert!(run(3), "immediate: inside the begin");
+        assert!(!run(0), "manual: when dispatched, after it");
     }
 
     #[test]

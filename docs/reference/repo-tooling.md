@@ -127,7 +127,7 @@ Both end in `victory run <exe> --execute`; neither builds anything.
 
 | | `scripts/play.ps1` | `Play-VIctory.cmd` |
 |---|---|---|
-| usage | `scripts\play.ps1 -Exe <exe> [-Safe] [-RayTracing] [-Build diag\|release] [-More @{NAME='v'}]` | `Play-VIctory.cmd [pareto-residency]` (any other argument: usage, exit 2) |
+| usage | `scripts\play.ps1 -Exe <exe> [-Safe] [-NoRayTracing] [-Build diag\|release] [-More @{NAME='v'}]` | `Play-VIctory.cmd [pareto-residency]` (any other argument: usage, exit 2) |
 | binary | `<script dir>\..\target\<Build>\victory.exe`, default `diag` | `<cmd dir>\victory-3d-rtx-pareto-residency.exe` (release ZIP), else `<cmd dir>\target\release\victory.exe` |
 | title exe | `-Exe` (required) | `%VICTORY_GAME_DIR%\game_scarlett_master.exe`; `VICTORY_GAME_DIR` defaults to `%~dp0..\GTA6.Xbox.v1.0.2.1` |
 | console | default (`series-x`) | `--console series-s` |
@@ -144,7 +144,8 @@ joined parts, upload-ahead, show-after, ambient 0.8, …). `play.ps1` adds
 `VICTORY_SKIP_PIPELINES=none` (both only meaningful in diag builds; `none` is
 not a valid hash and is ignored with a warning), `-Safe` swaps the three
 newest (`THIN`, `JOIN_PARTS`, `UPLOAD_AHEAD`) for `UNDER_WIDE=0`,
-`LAND_ECHO=0`, `-RayTracing` sets `VICTORY_BVH_BUILDER=1`. `Play-VIctory.cmd`
+`LAND_ECHO=0`, `-NoRayTracing` sets `VICTORY_BVH_BUILDER=0` (ray tracing is
+on by default since 2026-11-26). `Play-VIctory.cmd`
 adds the "residency" set: `VICTORY_LEVELS_ON_DEMAND=1`,
 `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_AMBIENT_AIR=1.5`. The scripts do
 not say why each is chosen; the read-site comments do. Neither sets
