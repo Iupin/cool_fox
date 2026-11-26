@@ -3041,6 +3041,35 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` (a dynamic one) the unordered access view `view`
+    /// for the host's clear of it (`crate::list::clear`), which names the
+    /// view twice: by the slot's handle in this heap, which the list has
+    /// set, and by a handle of the same descriptor in a heap the card does
+    /// not see ([`clear_slot`]). Gives both handles and the host resource
+    /// the view is of (a buffer's host copy, a texture, a depth texture's
+    /// colour twin), as [`make`] makes it; `None` (the slot is left as it
+    /// was) if the host cannot make it.
+    pub(crate) fn make_for_clear(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+        ID3D12Resource,
+    )> {
+        if self.sampler || !matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+            return None;
+        }
+        let at = clear_slot()?;
+        let resource = make(view, at).flatten()?;
+        self.copy_from(index, at);
+        self.clear_twin(index);
+        self.write_stride(index, view_stride_word(view));
+        self.keep(index, Some(resource.clone()));
+        Some((self.gpu_handle(index), at, resource))
+    }
+
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a live shader-visible heap.
@@ -3484,6 +3513,57 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
     })
 }
+
+/// A slot of a heap the card does not see, for the view that a clear of an
+/// unordered access view names by its CPU handle
+/// ([`HostHeap::make_for_clear`]): the host wants that handle in such a heap
+/// and reads the descriptor during the call (`ClearUnorderedAccessView*`),
+/// as it does render target views. The slots go round; one is made again
+/// [`CLEAR_SLOTS`] clears later, long after the call that read it returned.
+/// `None` without a host or a heap.
+fn clear_slot() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    struct Ring {
+        start: usize,
+        step: usize,
+        _heap: ID3D12DescriptorHeap,
+    }
+    // SAFETY: descriptor heaps are free-threaded; each slot is written by
+    // the one call that took it.
+    unsafe impl Send for Ring {}
+    // SAFETY: as above.
+    unsafe impl Sync for Ring {}
+    static RING: std::sync::OnceLock<Option<Ring>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let ring = RING
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain heap creation and queries.
+            unsafe {
+                let heap: ID3D12DescriptorHeap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: CLEAR_SLOTS,
+                        ..Default::default()
+                    })
+                    .inspect_err(|e| tracing::warn!(error = %e, "no heap for the views of unordered access clears"))
+                    .ok()?;
+                Some(Ring {
+                    start: heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                    step: host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                    _heap: heap,
+                })
+            }
+        })
+        .as_ref()?;
+    let slot = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % CLEAR_SLOTS;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: ring.start + slot as usize * ring.step,
+    })
+}
+
+/// Slots of [`clear_slot`]'s heap.
+const CLEAR_SLOTS: u32 = 1024;
 
 /// Logs `what` the first time it happens.
 macro_rules! once {

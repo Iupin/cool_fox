@@ -128,6 +128,9 @@ struct Card {
     touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Whether `size` is counted in `CARD_SMALL_BYTES` too ([`card_for`]),
+    /// to be counted down there when the copy goes.
+    small: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -166,11 +169,24 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// The budget (MiB) up to which the smallest tier of [`default_card_limits_mb`]
+/// applies.
+const TWELVE_GIB_MB: u64 = 12 * 1024;
+
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP): `(16, 512)` MiB.
+/// - `<= 12 GiB` (8–12 GB cards, whose WDDM budget is below 12 GiB):
+///   `(16, max(512, budget_mb / 7))` MiB. 512 MiB was full before the title's
+///   upscaler made its 21 MB scratch buffer on an RTX 3080 10 GB (budget
+///   8.3-9.3 GiB, 2026-11-26), and every one of its passes then read PC
+///   memory over the bus (about 230 ms of the card's time a frame). The
+///   copies it wanted came to about 690 MiB (buffers of 1 MiB or more) and
+///   880 MiB (all of them, at 64 KiB); a seventh of the budget is
+///   1,214-1,360 MiB there, around the 1,280 that was measured fine. At
+///   12 GiB it is 1,755 MiB, under the next tier's 2,048: a larger budget
+///   never gets a smaller cap.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -181,10 +197,9 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
-    const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        (16, (budget_mb / 7).max(512))
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -207,48 +222,164 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
-/// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
-/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
-/// on `>= 20 GiB` budgets), and explicit env vars always override.
-fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+/// What decides which title buffers get a copy in the card's memory
+/// ([`card_limits`]), in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CardLimits {
+    /// The smallest title buffer whose copy goes to the card.
+    least: u64,
+    /// The tier's own smallest ([`default_card_limits_mb`]): copies under it
+    /// are the "small" ones, made only because `least` was set lower.
+    tier_least: u64,
+    /// The most bytes of all copies ("before" twins not counted).
+    most: u64,
+    /// The most bytes of the small copies together: `most` but for the
+    /// `<= 12 GiB` tier's default cap, where a quarter of the cap is kept
+    /// for copies of `tier_least` or more ([`card_admit`]).
+    small_most: u64,
+}
+
+/// [`CardLimits`] from the adapter's local VRAM budget and the switches:
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB`,
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (which, when above 0, replaces the first)
+/// and `VICTORY_CARD_ALL` (which makes the least 0).
+///
+/// The small copies' share is kept only where the cap is the default of the
+/// `<= 12 GiB` tier (or of an unknown budget): there a cap of 512 MiB was
+/// seen full of some 2,900 copies of 64 KiB buffers (`_MIN_KB=64`, as the
+/// launcher sets it) and world buffers before a late big buffer came. An
+/// explicit `VICTORY_CARD_BUFFERS_MB`, and the larger tiers, keep first
+/// come, first served, as before.
+fn card_limits_from(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+    min_kb_override: Option<u64>,
+    all: bool,
+) -> CardLimits {
+    let (mut least, most) = resolve_card_limits(local_vram_budget, min_mb_override, max_mb_override);
+    if let Some(kib) = min_kb_override
+        && kib > 0
+    {
+        least = kib.saturating_mul(1 << 10);
+    }
+    if all {
+        least = 0;
+    }
+    let tier_least = default_card_limits_mb(local_vram_budget).0 << 20;
+    let smallest_tier = local_vram_budget.is_none_or(|b| b >> 20 <= TWELVE_GIB_MB);
+    let small_most = if smallest_tier && max_mb_override.is_none() { most - most / 4 } else { most };
+    CardLimits { least, tier_least, most, small_most }
+}
+
+/// The smallest title buffer whose copy goes to the card's memory, the most
+/// bytes of such copies (their "before" twins not counted: a copy shaders
+/// write takes its size twice), and the share of them small copies may take
+/// ([`CardLimits`], [`card_limits_from`]): `VICTORY_CARD_BUFFERS_MIN_MB`,
+/// `VICTORY_CARD_BUFFERS_MIN_KB` and `VICTORY_CARD_BUFFERS_MB`.
+/// Defaults scale with the adapter's local VRAM budget (16 MiB / at least
+/// 512 MiB, a seventh of the budget, on `<= 12 GiB` budgets, 4 MiB /
+/// 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB on `>= 20 GiB` budgets),
+/// and explicit env vars always override.
+fn card_limits() -> CardLimits {
+    static LIMITS: std::sync::OnceLock<CardLimits> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let env_u64 = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let limits = card_limits_from(
             vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            env_u64("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_u64("VICTORY_CARD_BUFFERS_MB"),
+            // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
+            // least size in KiB, so that it can go under 1 MiB: 64 is every
+            // title buffer. Copies under 1 MiB are nearly all there are and
+            // few bytes; in the PC's memory every load, store and atomic a
+            // shader does on them crosses the bus. Copies under the tier's
+            // own least size share at most three quarters of the default cap
+            // on `<= 12 GiB` budgets (`card_limits_from`).
+            env_u64("VICTORY_CARD_BUFFERS_MIN_KB"),
+            card_all(),
         );
-        // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
-        // least size in KiB, so that it can go under 1 MiB: 64 is every title
-        // buffer. Copies under 1 MiB are nearly all there are and few bytes;
-        // in the PC's memory every load, store and atomic a shader does on
-        // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
-            min_bytes = kib << 10;
-        }
-        if card_all() {
-            min_bytes = 0;
-        }
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_kb = min_bytes >> 10,
-            card_buffers_max_mb = max_bytes >> 20,
+            card_buffers_min_kb = limits.least >> 10,
+            card_buffers_max_mb = limits.most >> 20,
+            card_buffers_small_kb = limits.tier_least >> 10,
+            card_buffers_small_max_mb = limits.small_most >> 20,
             "card buffer limits"
         );
-        (min_bytes, max_bytes)
+        limits
     })
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Bytes alive of the card sides of small copies (under
+/// [`CardLimits::tier_least`]), also counted in `CARD_BYTES[0]`.
+static CARD_SMALL_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Title buffers turned down by [`card_limits`]' cap or small share since
+/// the start, and their bytes (their room is not given up: see
+/// [`card_room_kept`]).
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Why [`card_admit`] gave a title buffer no copy in the card's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardRefusal {
+    /// Under [`CardLimits::least`], or 1 GiB or more (the compare counts in
+    /// 32 bits).
+    Size,
+    /// The card has no room under the line ([`card_room_for`]).
+    Room,
+    /// A small copy, and the small copies' share is full.
+    SmallShare,
+    /// All copies' cap is full.
+    Cap,
+}
+
+/// What [`card_admit`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardAdmit {
+    /// A copy is made; `small` if it counts in the small copies' share.
+    Yes { small: bool },
+    No(CardRefusal),
+}
+
+/// Whether a title buffer of `size` bytes gets a copy in the card's memory,
+/// given the limits, the bytes held by small and by other copies, the card's
+/// `[budget, used]` if known, and the hundredths of the budget a copy may go
+/// up to. In this order: the size, the card's room, the small copies' share
+/// (small copies only), all copies' cap.
+fn card_admit(
+    size: u64,
+    limits: &CardLimits,
+    small_held: u64,
+    large_held: u64,
+    memory: Option<[u64; 2]>,
+    hundredths: u64,
+) -> CardAdmit {
+    if size < limits.least || size >= 1 << 30 {
+        return CardAdmit::No(CardRefusal::Size);
+    }
+    if let Some([budget, used]) = memory
+        && used.saturating_add(size) > budget / 100 * hundredths
+    {
+        return CardAdmit::No(CardRefusal::Room);
+    }
+    let small = size < limits.tier_least;
+    if small && small_held.saturating_add(size) > limits.small_most {
+        return CardAdmit::No(CardRefusal::SmallShare);
+    }
+    if small_held.saturating_add(large_held).saturating_add(size) > limits.most {
+        return CardAdmit::No(CardRefusal::Cap);
+    }
+    CardAdmit::Yes { small }
+}
+
+/// Held while [`card_room_for`] decides and counts a copy, so that two
+/// threads cannot both take the last of the cap.
+static CARD_ADMITTING: Mutex<()> = Mutex::new(());
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -265,7 +396,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// the frame went from about 240 to 370-470 ms.
 ///
 /// With the switch, the texture queue's rule (`resource::room`) counts the
-/// part of [`card_limits`]' second number that no copy has taken yet as
+/// part of [`card_limits`]' cap that no copy has taken yet as
 /// used, and a copy may be made up to nine tenths of the budget: the room
 /// it takes was kept for it. After the burst what is kept is what the
 /// burst left of the limit (87 MB of 1,024 in run 189).
@@ -292,7 +423,9 @@ static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
-/// the switch off or without card copies.
+/// the switch off or without card copies. Buffers the cap or the small
+/// copies' share turned down ([`CARD_CAPPED`]) do not give up room: what is
+/// left under the cap is kept for copies of the tier's size.
 pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
@@ -303,7 +436,7 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_limits().most.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -346,7 +479,10 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+///
+/// With the buffer, whether the copy counts in the small copies' share
+/// (`CARD_SMALL_BYTES`, given back when the copy goes: `Card::small`).
+fn card_for(size: u64) -> Option<(ID3D12Resource, bool)> {
     let there = card_room_for(size);
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
@@ -358,7 +494,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((buffer, false))
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -376,12 +512,12 @@ fn card_all() -> bool {
 }
 
 /// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+fn card_room_for(size: u64) -> Option<(ID3D12Resource, bool)> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    let limits = card_limits();
+    if size < limits.least || size >= 1 << 30 {
         return None;
     }
     let host = host()?;
@@ -393,44 +529,86 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // the world loads, before the textures fill the card; the texture
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // shrinks by the copies' bytes, at most `card_limits`' cap.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
-    {
-        // Said, with the numbers it was decided by: run 193 made 31 copies
-        // of 95 and no line named the others. The first 64, then every
-        // 32nd.
-        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
-        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
-        if n <= 64 || n.is_multiple_of(32) {
-            tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
-                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
-                size >> 10,
-                used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
-                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
-                most >> 20,
-                n,
-                bytes >> 20,
-                crate::frame::current()
-            );
+    let memory = host.video_memory().map(|[budget, used, ..]| [budget, used]);
+    // Decided and counted under one lock (copies going are counted down
+    // outside it, which can only make a decision stricter than it need be).
+    let admitting = CARD_ADMITTING.lock().unwrap_or_else(|e| e.into_inner());
+    let total = CARD_BYTES[0].load(Ordering::Relaxed);
+    let small_held = CARD_SMALL_BYTES.load(Ordering::Relaxed).min(total);
+    let small = match card_admit(size, &limits, small_held, total - small_held, memory, hundredths) {
+        CardAdmit::Yes { small } => small,
+        CardAdmit::No(CardRefusal::Size) => return None,
+        CardAdmit::No(CardRefusal::Room) => {
+            drop(admitting);
+            let [budget, used] = memory.unwrap_or_default();
+            // Said, with the numbers it was decided by: run 193 made 31
+            // copies of 95 and no line named the others. The first 64, then
+            // every 32nd.
+            let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+            if n <= 64 || n.is_multiple_of(32) {
+                tracing::info!(
+                    "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up \
+                     to {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+                    size >> 10,
+                    used >> 20,
+                    budget >> 20,
+                    (budget / 100 * hundredths) >> 20,
+                    total >> 20,
+                    limits.most >> 20,
+                    n,
+                    bytes >> 20,
+                    crate::frame::current()
+                );
+            }
+            return None;
+        }
+        CardAdmit::No(why) => {
+            drop(admitting);
+            // Said as the card's room is: a buffer the cap turned down was
+            // not named before (2026-11-26: the upscaler's 21 MB scratch
+            // buffer, which then ran every pass over the bus). Its room is
+            // not given up: the cap is full or the room is kept for copies
+            // of the tier's size.
+            let n = CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed) + size;
+            if n <= 64 || n.is_multiple_of(32) {
+                tracing::info!(
+                    "no card copy for a title buffer of {} KiB: turned down by {}; the copies made hold {} MB of at most {} MB, {} MB \
+                     of them copies under {} KiB, which may hold at most {} MB together; {} buffers turned down by the cap so far \
+                     ({} MB), frame {}",
+                    size >> 10,
+                    if why == CardRefusal::SmallShare { "the small copies' share" } else { "the cap of all copies" },
+                    total >> 20,
+                    limits.most >> 20,
+                    small_held >> 20,
+                    limits.tier_least >> 10,
+                    limits.small_most >> 20,
+                    n,
+                    bytes >> 20,
+                    crate::frame::current()
+                );
+            }
+            return None;
+        }
+    };
+    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    if small {
+        CARD_SMALL_BYTES.fetch_add(size, Ordering::Relaxed);
+    }
+    drop(admitting);
+    let Some(buffer) = host.uav_buffer(size) else {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        if small {
+            CARD_SMALL_BYTES.fetch_sub(size, Ordering::Relaxed);
         }
         return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-    }
-    buffer
+    };
+    Some((buffer, small))
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -2115,7 +2293,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -2500,6 +2678,9 @@ impl Drop for Shadow {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+                if card.small {
+                    CARD_SMALL_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                }
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -4428,6 +4609,7 @@ impl Shadow {
                 sent: Mutex::default(),
                 touched: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
+                small: false,
             });
         }
         let shadow = Arc::new(shadow);
@@ -4584,6 +4766,7 @@ mod land_tests {
             sent: Mutex::default(),
                 touched: Default::default(),
             size: len as u64,
+            small: false,
         });
         Some(shadow)
     }
@@ -4722,7 +4905,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -4975,7 +5158,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
+        let big = cards() && (size >= card_limits().least || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4985,7 +5168,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+            Some((on_card, small)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -4999,6 +5182,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                 touched: Default::default(),
                     size,
+                    small,
                 };
                 (on_card, Some(card))
             }
@@ -5227,6 +5411,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         sent: Mutex::default(),
         touched: Default::default(),
         size: len,
+        small: false,
     });
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -5316,6 +5501,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 touched: Default::default(),
                 size: len,
+                small: false,
             };
             (on_card, Some(card))
         }
@@ -5423,6 +5609,180 @@ pub(crate) fn exact_line(frames: f64) {
 }
 
 #[cfg(test)]
+mod card_limit_tests {
+    use super::{CardAdmit, CardLimits, CardRefusal, card_admit, card_limits_from};
+
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    /// The defaults, no switch set.
+    fn stock(budget: Option<u64>) -> CardLimits {
+        card_limits_from(budget, None, None, None, false)
+    }
+
+    /// Asks for copies of `sizes` in turn, as `card_room_for` does, on a card
+    /// with `budget` whose use starts at `used` and grows by each copy made.
+    fn replay(limits: &CardLimits, sizes: &[u64], budget: u64, mut used: u64) -> Vec<CardAdmit> {
+        let (mut small_held, mut large_held) = (0, 0);
+        sizes
+            .iter()
+            .map(|&size| {
+                let made = card_admit(size, limits, small_held, large_held, Some([budget, used]), 97);
+                if let CardAdmit::Yes { small } = made {
+                    *(if small { &mut small_held } else { &mut large_held }) += size;
+                    used += size;
+                }
+                assert!(small_held <= limits.small_most && small_held + large_held <= limits.most);
+                made
+            })
+            .collect()
+    }
+
+    /// The title buffers of the session of 2026-11-26 (RTX 3080 10 GB, Series S
+    /// profile, the launcher's `VICTORY_CARD_BUFFERS_MIN_KB=64`) in the order
+    /// they came: some 2,900 of 64 KiB, about 640 MiB of world buffers of
+    /// 1-24 MiB, then the upscaler's scratch buffer (21,045,760 bytes,
+    /// rounded up to 64 KiB as `lookup` does).
+    fn session_of_2026_11_26() -> Vec<u64> {
+        let mut sizes = vec![64 * KIB; 2900];
+        let mut world = 0;
+        for mib in [1, 2, 3, 4, 6, 8, 12, 16, 24].into_iter().cycle() {
+            if world >= 640 * MIB {
+                break;
+            }
+            sizes.push(mib * MIB);
+            world += mib * MIB;
+        }
+        sizes.push(21_045_760u64.next_multiple_of(64 * KIB));
+        sizes
+    }
+
+    #[test]
+    fn the_cap_never_gets_smaller_with_a_larger_budget() {
+        let mut budgets: Vec<u64> = (0..=64 * GIB).step_by(MIB as usize).collect();
+        budgets.extend([12 * GIB + 1, 12 * GIB + MIB - 1, 20 * GIB - 1]);
+        budgets.sort_unstable();
+        let mut last = stock(Some(0));
+        for budget in budgets {
+            let now = stock(Some(budget));
+            assert!(now.most >= last.most, "cap fell at {budget} bytes");
+            assert!(now.small_most >= last.small_most, "small share fell at {budget} bytes");
+            last = now;
+        }
+        // Around the 12 GiB line, explicitly.
+        assert!(stock(Some(12 * GIB + MIB)).most > stock(Some(12 * GIB)).most);
+        assert!(stock(Some(12 * GIB + MIB)).small_most > stock(Some(12 * GIB)).small_most);
+    }
+
+    #[test]
+    fn the_smallest_tier_scales_with_the_budget_and_keeps_a_quarter_for_its_own_size() {
+        for (budget, most_mb) in [(8 * GIB, 1170), (9 * GIB, 1316), (10 * GIB, 1462), (12 * GIB, 1755), (3 * GIB, 512)] {
+            let limits = stock(Some(budget));
+            assert_eq!(limits.least, 16 * MIB);
+            assert_eq!(limits.tier_least, 16 * MIB);
+            assert_eq!(limits.most, most_mb * MIB);
+            assert_eq!(limits.small_most, limits.most - limits.most / 4);
+        }
+        // Unknown budget: 512 MiB as before, with the share.
+        assert_eq!(stock(None), CardLimits { least: 16 * MIB, tier_least: 16 * MIB, most: 512 * MIB, small_most: 384 * MIB });
+    }
+
+    #[test]
+    fn larger_tiers_are_as_they_were() {
+        for (budget, least_mb, most_mb) in [
+            (12 * GIB + 100 * MIB, 4, 2048),
+            (13 * GIB, 4, 2048),
+            (16 * GIB, 4, 2048),
+            (20 * GIB - MIB, 4, 2048),
+            (20 * GIB, 1, 5120),
+            (24 * GIB, 1, 6144),
+            (32 * GIB, 1, 8192),
+            (48 * GIB, 1, 8192),
+        ] {
+            let want = CardLimits { least: least_mb * MIB, tier_least: least_mb * MIB, most: most_mb * MIB, small_most: most_mb * MIB };
+            assert_eq!(stock(Some(budget)), want);
+            // With the launcher's 64 KiB least: no share either.
+            let low = card_limits_from(Some(budget), None, None, Some(64), false);
+            assert_eq!(low, CardLimits { least: 64 * KIB, ..want });
+        }
+    }
+
+    #[test]
+    fn switches_override_as_before() {
+        let budget = Some(9 * GIB);
+        // `_MB` set: that cap, first come, first served (no share).
+        let set = card_limits_from(budget, None, Some(640), Some(64), false);
+        assert_eq!(set, CardLimits { least: 64 * KIB, tier_least: 16 * MIB, most: 640 * MIB, small_most: 640 * MIB });
+        // `_MIN_MB`, clamped to 1 MiB; `_MIN_KB` replaces it; `_MIN_KB=0` does not.
+        assert_eq!(card_limits_from(budget, Some(0), None, None, false).least, MIB);
+        assert_eq!(card_limits_from(budget, Some(4), None, None, false).least, 4 * MIB);
+        assert_eq!(card_limits_from(budget, Some(4), None, Some(1024), false).least, MIB);
+        assert_eq!(card_limits_from(budget, Some(4), None, Some(0), false).least, 4 * MIB);
+        // `VICTORY_CARD_ALL`: every size.
+        assert_eq!(card_limits_from(budget, None, None, Some(64), true).least, 0);
+        // The default cap keeps its share whatever the least is.
+        assert_eq!(card_limits_from(budget, Some(1), None, None, false).small_most, 1316 * MIB - 329 * MIB);
+    }
+
+    #[test]
+    fn admission_says_why() {
+        let limits = CardLimits { least: 64 * KIB, tier_least: 16 * MIB, most: 1024 * MIB, small_most: 768 * MIB };
+        let room = Some([8 * GIB, 4 * GIB]);
+        assert_eq!(card_admit(0, &limits, 0, 0, room, 97), CardAdmit::No(CardRefusal::Size));
+        assert_eq!(card_admit(GIB, &limits, 0, 0, room, 97), CardAdmit::No(CardRefusal::Size));
+        assert_eq!(card_admit(64 * KIB, &limits, 0, 0, room, 97), CardAdmit::Yes { small: true });
+        assert_eq!(card_admit(16 * MIB, &limits, 0, 0, room, 97), CardAdmit::Yes { small: false });
+        assert_eq!(card_admit(16 * MIB - 1, &limits, 0, 0, room, 97), CardAdmit::Yes { small: true });
+        // The card's room comes first, then the share, then the cap.
+        let full = Some([8 * GIB, 8 * GIB / 100 * 97 - MIB]);
+        assert_eq!(card_admit(2 * MIB, &limits, 0, 0, full, 97), CardAdmit::No(CardRefusal::Room));
+        assert_eq!(card_admit(MIB, &limits, 0, 0, full, 97), CardAdmit::Yes { small: true });
+        assert_eq!(card_admit(MIB, &limits, 768 * MIB, 0, room, 97), CardAdmit::No(CardRefusal::SmallShare));
+        assert_eq!(card_admit(MIB, &limits, 767 * MIB, 0, room, 97), CardAdmit::Yes { small: true });
+        assert_eq!(card_admit(MIB, &limits, 512 * MIB, 512 * MIB, room, 97), CardAdmit::No(CardRefusal::Cap));
+        // A big one takes what the small ones left, up to the cap.
+        assert_eq!(card_admit(256 * MIB, &limits, 768 * MIB, 0, room, 97), CardAdmit::Yes { small: false });
+        assert_eq!(card_admit(257 * MIB, &limits, 768 * MIB, 0, room, 97), CardAdmit::No(CardRefusal::Cap));
+        // No budget known: no room check.
+        assert_eq!(card_admit(MIB, &limits, 0, 0, None, 97), CardAdmit::Yes { small: true });
+    }
+
+    #[test]
+    fn the_session_of_2026_11_26_gets_its_upscaler_buffer_on_the_card() {
+        let sizes = session_of_2026_11_26();
+        let (budget, used) = (9 * GIB, 5 * GIB);
+        // Before: a cap of 512 MiB, first come, first served; the last
+        // buffer was turned down by the cap.
+        let before = CardLimits { least: 64 * KIB, tier_least: 16 * MIB, most: 512 * MIB, small_most: 512 * MIB };
+        assert_eq!(replay(&before, &sizes, budget, used).last(), Some(&CardAdmit::No(CardRefusal::Cap)));
+        // Now, with the launcher's least of 64 KiB: everything fits.
+        let now = card_limits_from(Some(budget), None, None, Some(64), false);
+        let made = replay(&now, &sizes, budget, used);
+        assert_eq!(made.last(), Some(&CardAdmit::Yes { small: false }));
+        assert!(made.iter().all(|m| matches!(m, CardAdmit::Yes { .. })), "{made:?}");
+        // And at the low end of what that card's budget was (8.3 GiB).
+        let low = card_limits_from(Some(8499 * MIB), None, None, Some(64), false);
+        assert!(replay(&low, &sizes, 8499 * MIB, used).iter().all(|m| matches!(m, CardAdmit::Yes { .. })));
+    }
+
+    #[test]
+    fn small_buffers_cannot_crowd_out_a_late_big_one() {
+        // Far more small buffers than the cap holds, then a big one.
+        let mut sizes = vec![64 * KIB; 30_000];
+        sizes.extend([4 * MIB; 200]);
+        sizes.push(21_045_760u64.next_multiple_of(64 * KIB));
+        let limits = card_limits_from(Some(9 * GIB), None, None, Some(64), false);
+        let made = replay(&limits, &sizes, 9 * GIB, 3 * GIB);
+        assert!(made.contains(&CardAdmit::No(CardRefusal::SmallShare)));
+        assert_eq!(made.last(), Some(&CardAdmit::Yes { small: false }));
+        // Without the share (an explicit cap) the same order turns it down.
+        let set = card_limits_from(Some(9 * GIB), None, Some(1316), Some(64), false);
+        assert_eq!(replay(&set, &sizes, 9 * GIB, 3 * GIB).last(), Some(&CardAdmit::No(CardRefusal::Cap)));
+    }
+}
+
+#[cfg(test)]
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
@@ -5434,11 +5794,14 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) keeps the old baseline; <= 12 GiB
+        // takes a seventh of the budget, at least 512 MiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(3 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 1170));
+        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (16, 1316));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 1609));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 1755));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));

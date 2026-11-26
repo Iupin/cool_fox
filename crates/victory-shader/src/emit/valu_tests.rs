@@ -2391,3 +2391,148 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+/// The signed dot product of the four bytes of `a` and `b`, plus `acc`,
+/// wrapping: RDNA2's `v_dot4_i32_i8` and `v_dot4c_i32_i8` without clamp.
+fn dot4_i8_reference(acc: u32, a: u32, b: u32) -> u32 {
+    (0..4).fold(acc, |sum, i| {
+        let (x, y) = ((a >> (8 * i)) as u8 as i8, (b >> (8 * i)) as u8 as i8);
+        sum.wrapping_add((x as i32 * y as i32) as u32)
+    })
+}
+
+/// Byte patterns at the signed int8 ends and around them, mixed.
+const DOT4_CASES: [[u32; 4]; 10] = [
+    [0, 0, 0, 0],
+    [0x8080_8080, 0x8080_8080, 0, 0],
+    [0x7F7F_7F7F, 0x8080_8080, 5, 0],
+    [0xFFFF_FFFF, 0x0102_0304, 0, 0],
+    [0x80FF_7F01, 0x7F80_01FF, 0x7FFF_FFF0, 0],
+    [0xFBF2_01F7, 0x1234_5678, 0x8000_0000, 0],
+    [0x0302_FB02, 0xE6EB_F202, 0xFFFF_FF00, 0],
+    [0x7F7F_7F7F, 0x7F7F_7F7F, 0x7FFF_FFFF, 0],
+    [0x8080_8080, 0x7F7F_7F7F, 0x8000_0000, 0],
+    [0x00FF_0080, 0xFF00_8000, 1, 0],
+];
+
+#[test]
+fn dot4_i32_i8_forms_are_signed_and_wrap() {
+    // v_mov_b32 v0, v3 (the accumulator), then v_dot4c_i32_i8 v0, v1, v2.
+    let dot4c = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x0D, 0, vgpr(1), 2)]);
+    run_cases(&dot4c, &DOT4_CASES, |backend, _, [a, b, acc, _], got| {
+        assert_eq!(
+            got,
+            dot4_i8_reference(acc, a, b),
+            "{backend} dot4c {a:08x} {b:08x} {acc:08x}"
+        );
+    });
+    // VOP3P v_dot4_i32_i8 v0, v1, v2, v3 (op_sel_hi all set: unmodified).
+    let dot4 = build_valu_cs(&[
+        0xCC16_4000,
+        3 << 27 | (vgpr(3) as u32) << 18 | (vgpr(2) as u32) << 9 | vgpr(1) as u32,
+    ]);
+    run_cases(&dot4, &DOT4_CASES, |backend, _, [a, b, acc, _], got| {
+        assert_eq!(
+            got,
+            dot4_i8_reference(acc, a, b),
+            "{backend} dot4 {a:08x} {b:08x} {acc:08x}"
+        );
+    });
+    // v_dot4_i32_i8 v0, v1, 1 op_sel:[0,1] op_sel_hi:[1,0], v3: the inline
+    // constant's halves swapped, 0x00010000, so v3 plus v1's byte 2.
+    let byte2 = build_valu_cs(&[
+        0xCC16_4000 | 0b010 << 11,
+        1 << 27 | (vgpr(3) as u32) << 18 | 129 << 9 | vgpr(1) as u32,
+    ]);
+    run_cases(&byte2, &DOT4_CASES, |backend, _, [a, _, acc, _], got| {
+        assert_eq!(
+            got,
+            dot4_i8_reference(acc, a, 0x0001_0000),
+            "{backend} byte 2 of {a:08x}"
+        );
+    });
+    // The same with op_sel:[1,0] op_sel_hi:[0,1] on a VGPR source: v1's
+    // halves swapped before the product.
+    let swapped = build_valu_cs(&[
+        0xCC16_4000 | 0b001 << 11,
+        2 << 27 | (vgpr(3) as u32) << 18 | (vgpr(2) as u32) << 9 | vgpr(1) as u32,
+    ]);
+    run_cases(&swapped, &DOT4_CASES, |backend, _, [a, b, acc, _], got| {
+        let a = a.rotate_left(16);
+        assert_eq!(
+            got,
+            dot4_i8_reference(acc, a, b),
+            "{backend} swapped {a:08x} {b:08x}"
+        );
+    });
+}
+
+#[test]
+fn cvt_pk_u8_f32_rounds_to_nearest_even_and_saturates() {
+    // v_cvt_pk_u8_f32 v0, v1, v2, v3: float v1 into byte v2[1:0] of v3.
+    let shader = build_valu_cs(&vop3(0x15E, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let floats: [f32; 16] = [
+        0.0, -0.0, 0.5, 1.5, 2.5, 0.49999997, 127.5, 128.5, 254.5, 254.50002, 255.0, 255.49, 255.5,
+        300.0, -0.6, -200.0,
+    ];
+    let mut cases: Vec<[u32; 4]> = Vec::new();
+    for (i, x) in floats.iter().enumerate() {
+        cases.push([x.to_bits(), i as u32, 0xA5C3_E10F, 0]);
+    }
+    cases.push([f32::NAN.to_bits(), 1, 0x1234_5678, 0]);
+    cases.push([f32::INFINITY.to_bits(), 2, 0, 0]);
+    cases.push([f32::NEG_INFINITY.to_bits(), 3, u32::MAX, 0]);
+    run_cases(&shader, &cases, |backend, _, [x, sel, d, _], got| {
+        let x = f32::from_bits(x);
+        let byte = if x.is_nan() {
+            0
+        } else {
+            x.round_ties_even().clamp(0.0, 255.0) as u32
+        };
+        let sh = 8 * (sel & 3);
+        let want = (d & !(0xFF << sh)) | byte << sh;
+        assert_eq!(got, want, "{backend}: {x} into byte {sel} of {d:08x}");
+    });
+}
+
+#[test]
+fn fma_mix_f32_reads_the_f16_halves_op_sel_picks() {
+    // v_fma_mix_f32 v0, 1.0, sel_lo(v1), sel_hi(v1): v1's two f16 halves summed in f32.
+    let halves = build_valu_cs(&[
+        0xCC20_6000,
+        2 << 27 | (vgpr(1) as u32) << 18 | (vgpr(1) as u32) << 9 | 0xF2,
+    ]);
+    // v_fma_mix_f32 v0, sel_lo(0x58005400), v2, sel_hi(0x58005400): v2 * 64 + 128,
+    // the literal's halves as two f16 operands.
+    let literal = build_valu_cs(&[
+        0xCC20_6000,
+        1 << 27 | 0xFF << 18 | (vgpr(2) as u32) << 9 | 0xFF,
+        0x5800_5400,
+    ]);
+    let pairs: [(u16, u16); 5] = [
+        (0x3C00, 0x4000),
+        (0xBC00, 0x3800),
+        (0x7BFF, 0xFBFF),
+        (0x0001, 0x8000),
+        (0x5640, 0xC900),
+    ];
+    let floats: [f32; 5] = [0.0, -2.0, 1.5, -0.015625, 1.9921875];
+    let cases: Vec<[u32; 4]> = pairs
+        .iter()
+        .zip(floats)
+        .map(|(&(lo, hi), x)| [u32::from(hi) << 16 | u32::from(lo), x.to_bits(), 0, 0])
+        .collect();
+    run_cases(&halves, &cases, |backend, _, [h, _, _, _], got| {
+        let want = f16_to_f32(h as u16) + f16_to_f32((h >> 16) as u16);
+        assert_eq!(f32::from_bits(got), want, "{backend}: halves of {h:08x}");
+    });
+    run_cases(&literal, &cases, |backend, _, [_, x, _, _], got| {
+        let want = f32::from_bits(x).mul_add(64.0, 128.0);
+        assert_eq!(
+            f32::from_bits(got),
+            want,
+            "{backend}: {} * 64 + 128",
+            f32::from_bits(x)
+        );
+    });
+}

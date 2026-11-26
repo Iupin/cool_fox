@@ -109,3 +109,44 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+## 2026-11-26: card copies on a 10 GB card
+
+RTX 3080 10 GB (local budget 8.3-9.3 GB), 32 GB, Series S profile, the launcher
+(`Play-VIctory.cmd`, which sets `VICTORY_CARD_BUFFERS_MIN_KB=64`). 3.1 fps: a frame
+took about 320 ms, 230 of them the card's time in the upscaler's ten or so compute
+passes. They all read and write one scratch buffer of 21,045,760 bytes that the title
+makes in the first world frame, after the world's own buffers. By then the copies in
+the card's memory had filled their cap (512 MiB on budgets of 12 GiB or less), the
+buffer got no copy there, and every pass went over the bus. Nothing said so: only a
+copy turned down for the card's room was logged, not one turned down by the cap.
+
+| Cap, least size | Upscaler buffer on the card | Frame |
+|---|---|---|
+| 512 MiB, 64 KiB (the launcher) | no | about 320 ms |
+| 640 MiB, 64 KiB | no: some 2,900 buffers of 64 KiB, about 190 MiB, filled it again | – |
+| 640 MiB, 1 MiB | no: the world's buffers of 1 MiB or more came to about 640 MiB first | – |
+| 1,280 MiB, 1 MiB | yes: 82-83 copies, 687-688 MiB | 83-95 ms, the card 4-15 ms |
+
+With 1,280 MiB the card used 7.7-7.9 GB of its 8.7-8.8 GB budget, no copy was turned
+down for room, and textures were not short. What the title wanted on the card: about
+690 MiB of buffers of 1 MiB or more, about 880 MiB with the small ones at 64 KiB.
+
+What changed (`crates/victory-gpu/src/shadow.rs`, `card_limits_from`, `card_admit`):
+
+- The cap on budgets of 12 GiB or less is a seventh of the budget, at least 512 MiB:
+  1,214-1,360 MiB on that card, around the 1,280 measured. At 12 GiB it is 1,755 MiB,
+  under the 2,048 of the next tier, so a larger budget never gets a smaller cap. The
+  larger tiers are as they were. The room the texture queue keeps for copies not made
+  yet (at most 1 GiB) is then 1 GiB on these cards, as in the 1,280 run.
+- With the default cap of that tier, copies under its own least size (16 MiB) together
+  take at most three quarters of the cap; a quarter stays for the bigger ones, so a
+  late big buffer is not crowded out by thousands of small ones. Three quarters and not
+  one: the world's buffers of 1-16 MiB were on the card in the 1,280 run and should
+  still fit while the cap has room. An explicit `VICTORY_CARD_BUFFERS_MB` keeps first
+  come, first served.
+- A buffer turned down by the cap or by that share is logged as one turned down for
+  room is (the first 64, then every 32nd), naming which one, the bytes held and both
+  limits.
+
+Not measured in the game yet; a unit test replays the order of the session above.

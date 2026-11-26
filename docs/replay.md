@@ -138,7 +138,13 @@ The `--diverge` family runs the recorded copies without the merge.
 - Not recorded, but reported when used: reserved (tiled) resources, bundles,
   ray tracing, render passes, enhanced barriers, predication, stream output,
   `ClearUnorderedAccessView`, shading rate, newer creation methods
-  (`CreateCommittedResource1` and on).
+  (`CreateCommittedResource1` and on). Since 2026-11-26 the layer issues
+  `ClearUnorderedAccessViewUint/Float` for the title's own clears
+  (`list/clear.rs`): a frame recorded with them replays without them. Left
+  out because the host's clear names its view by a CPU handle in a heap the
+  card does not see, which the recording has no kind of slot for, and by a
+  GPU handle in the heap set; recording it needs a new `Cmd` kind and such a
+  heap in the player.
 - Not kept: contents of multisampled textures, of textures in memory the CPU
   sees, and of texture levels over 256 MB; resources of other queues' work.
 - Texture states come from the barriers seen. A resource that overlaps the

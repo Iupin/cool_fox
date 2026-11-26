@@ -400,6 +400,43 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// Whether `hash` is listed in the comma-separated environment variable
+/// `name` (16-hex shader hashes).
+fn listed(hash: &str, list: &std::sync::OnceLock<Vec<String>>, name: &str) -> bool {
+    list.get_or_init(|| {
+        std::env::var(name)
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
+/// `VICTORY_LINEAR_SAMPLERS=<hash>,...`: an experiment. The static samplers
+/// of those shaders filter linearly in all three (min, mag, mip), whatever
+/// the console's sampler words say; their reduction and comparison are
+/// kept. Read when a host pipeline is made.
+fn linear_samplers(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    listed(hash, &LIST, "VICTORY_LINEAR_SAMPLERS")
+}
+
+/// Whether pipelines of shader `hash` are logged when their root signature
+/// is made and listed when a frame's draws bind them (`VICTORY_ROOT_LOG`).
+pub(crate) fn root_logged(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    listed(hash, &LIST, "VICTORY_ROOT_LOG")
+}
+
+/// A `D3D12_FILTER` made linear in min, mag and mip, its reduction and
+/// comparison bits (0x180) kept ([`linear_samplers`]).
+fn all_linear(filter: u32) -> u32 {
+    0x15 | filter & 0x180
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -573,9 +610,12 @@ impl HostPipeline {
                     });
                 }
             }
+            let linear = linear_samplers(&shader.hash);
             for (n, s) in t.static_samplers.iter().enumerate() {
+                let filter = s.filter_for_host(aniso_point_mip_supported);
+                let filter = if linear { all_linear(filter) } else { filter };
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+                    Filter: D3D12_FILTER(filter as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -599,6 +639,29 @@ impl HostPipeline {
                 return None;
             }
         };
+        // `VICTORY_ROOT_LOG=<hash>,...`: the root signature of pipelines of
+        // those shaders, as made: its object, a fingerprint of its blob and
+        // every static sampler (filter, register, space, visibility).
+        if stages.iter().any(|(s, _)| root_logged(&s.hash)) {
+            let statics: Vec<(i32, u32, u32, i32)> = samplers
+                .iter()
+                .map(|s| {
+                    (
+                        s.Filter.0,
+                        s.ShaderRegister,
+                        s.RegisterSpace,
+                        s.ShaderVisibility.0,
+                    )
+                })
+                .collect();
+            tracing::info!(
+                ?shaders,
+                root = ?windows::core::Interface::as_raw(&root),
+                blob = %&blake3::hash(&root_blob).to_hex()[..16],
+                ?statics,
+                "host root signature of a listed shader (filter, register, space, visibility)"
+            );
+        }
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -1082,6 +1145,16 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// `VICTORY_LINEAR_SAMPLERS`: point and linear-mip-point become
+    /// trilinear; comparison and min/max reduction stay.
+    #[test]
+    fn forced_linear_filters_keep_reduction_and_comparison() {
+        assert_eq!(all_linear(0x00), 0x15);
+        assert_eq!(all_linear(0x14), 0x15);
+        assert_eq!(all_linear(0x94), 0x95);
+        assert_eq!(all_linear(0x154), 0x115);
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {

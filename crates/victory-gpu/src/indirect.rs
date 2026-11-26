@@ -304,8 +304,6 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -2696,7 +2694,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Three records of 16,384 x 64 groups (2^20, the most a dispatch
+        // runs): exactly half the budget each, so the first two spend all of
+        // it whether or not the third, which does not fit, takes the rest
+        // (`rest`, off by default since f4b48ad). With 65,535 x 16 the two
+        // left 2,048 over, which the small record fitted in once the third
+        // no longer took it.
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2709,7 +2712,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
             for i in 0..3 {
-                let words = [65535u32, 16, 1];
+                let words = [16_384u32, 64, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -3146,22 +3149,29 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     }
 
     /// Records past the list's budget come out empty, and one read by many
-    /// executions is charged for each.
+    /// executions is charged for each: a record that does not fit takes the
+    /// rest of the budget with [`rest`] on, and nothing with it off (the
+    /// default since f4b48ad), so both are pinned here as in
+    /// `four_records_of_a_group`.
     #[test]
     fn warp_batch_charges_every_execution() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
+        let passes = [false, true].map(|rest| {
+            let source = batch::SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+            (rest, make_from(&warp.device, &source).expect("the batched clamp must compile on WARP"))
+        });
         // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+        let cases = [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)];
+        for ((rest, pass), (times, records, filled)) in passes.iter().flat_map(|p| cases.map(|c| (p, c))) {
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -3190,9 +3200,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
                 )
             };
-            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
-            assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let at = format!("rest {rest}, {times} times {records}");
+            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{at}: {out:?}");
+            assert!(out.iter().all(|&v| v == 0 || v == 1 << 22), "{at}: {out:?}");
+            // Each record that ran was charged once per execution; one that
+            // did not fit charged the rest of the budget, or nothing.
+            let charged = if *rest { BUDGET.min((1 << 26) * times * records as u32) } else { (1 << 26) * times * filled as u32 };
+            assert_eq!(spent, charged, "{at}");
         }
     }
 
@@ -3428,7 +3442,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3736,7 +3749,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,

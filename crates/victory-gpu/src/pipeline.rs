@@ -165,11 +165,18 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
+                    // `dxil`: a fingerprint of the translation, and the
+                    // console's words and the host filters of its static
+                    // samplers: two launches that differ on screen can be
+                    // told apart (or not) by what was translated.
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        dxil = %&blake3::hash(&t.host.dxil).to_hex()[..16],
+                        sampler_words = ?t.host.samplers,
+                        sampler_filters = ?t.host.static_samplers.iter().map(|s| s.filter).collect::<Vec<_>>(),
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(

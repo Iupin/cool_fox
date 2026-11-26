@@ -383,7 +383,15 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        // Volumes too (colour look-up tables): their slices side by side.
+        if d.SampleDesc.Count > 1
+            || !matches!(
+                d.Dimension,
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                    | D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            )
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -441,7 +449,33 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // A volume's slices follow each other, a row pitch times the height
+        // apart.
+        let depth = f.Depth.max(1) as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize * depth);
+        if depth > 1 {
+            save_volume(frame, i, resource, d.Format.0 as u32, &f, rows);
+            buffer.Unmap(0, None);
+            return;
+        }
+        // One-dimensional tables (tone curves) of 32-bit floats: as numbers.
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && f.Format == DXGI_FORMAT_R32_FLOAT {
+            let values: Vec<f32> = rows[..f.Width as usize * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let (distinct, equal_neighbours, largest_step, samples) = curve_summary(&values);
+            tracing::info!(
+                frame,
+                ?resource,
+                width = values.len(),
+                distinct,
+                equal_neighbours,
+                largest_step,
+                ?samples,
+                "1D table values: distinct values, equal neighbours, the largest step, 17 samples"
+            );
+        }
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -473,6 +507,150 @@ fn dump_one(
         }
         buffer.Unmap(0, None);
     }
+}
+
+/// Of a 1D table: how many distinct values it holds, how many neighbours
+/// are equal, the largest step between neighbours, and 17 values evenly
+/// spread from the first to the last. A smooth curve of 4096 entries has
+/// thousands of distinct values and small steps; a staircase has few
+/// values, many equal neighbours and large steps.
+fn curve_summary(values: &[f32]) -> (usize, usize, f32, Vec<f32>) {
+    let mut bits: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+    bits.sort_unstable();
+    bits.dedup();
+    let equal = values.windows(2).filter(|w| w[0].to_bits() == w[1].to_bits()).count();
+    let step = values
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|s| s.is_finite())
+        .fold(0f32, f32::max);
+    let last = values.len().saturating_sub(1);
+    let samples = if values.is_empty() {
+        Vec::new()
+    } else {
+        (0..=16).map(|k| values[k * last / 16]).collect()
+    };
+    (bits.len(), equal, step, samples)
+}
+
+/// Bytes a texel of the formats [`to_rgba`] decodes (none for the others).
+fn texel_size(format: u32) -> Option<usize> {
+    Some(match format {
+        1..=4 => 16,
+        9..=22 => 8,
+        23..=47 | 87..=93 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        _ => return None,
+    })
+}
+
+/// Of a volume of `n`-byte texels (rows `pitch` bytes apart, slices
+/// `pitch * h`), how many pairs of neighbours along x, y and z hold the same
+/// first `key` bytes, and how many pairs there are along each. A smooth
+/// colour table has next to no equal neighbours; one whose texels came out
+/// in blocks, or whose slices repeat, has many.
+fn volume_repeats(
+    rows: &[u8],
+    [w, h, depth]: [usize; 3],
+    pitch: usize,
+    n: usize,
+    key: usize,
+) -> ([usize; 3], [usize; 3]) {
+    let slice = pitch * h;
+    let texel = |x: usize, y: usize, z: usize| &rows[z * slice + y * pitch + x * n..][..key];
+    let mut same = [0; 3];
+    for z in 0..depth {
+        for y in 0..h {
+            for x in 0..w {
+                let t = texel(x, y, z);
+                same[0] += usize::from(x + 1 < w && t == texel(x + 1, y, z));
+                same[1] += usize::from(y + 1 < h && t == texel(x, y + 1, z));
+                same[2] += usize::from(z + 1 < depth && t == texel(x, y, z + 1));
+            }
+        }
+    }
+    let pairs = [
+        w.saturating_sub(1) * h * depth,
+        w * h.saturating_sub(1) * depth,
+        w * h * depth.saturating_sub(1),
+    ];
+    (same, pairs)
+}
+
+/// A volume read back by [`read_back`]: its slices side by side (slice `z`
+/// from x = `z * width`), each texel doubled so the half-size picture keeps
+/// every one, as `frame-<n>-<i>-<resource>-<w>x<h>x<d>-f<format>-slices.png`.
+/// Logged: equal neighbours along each axis ([`volume_repeats`]) and, for
+/// 16-bit float colour, the texels of the grey diagonal (x = y = z).
+fn save_volume(
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
+    format: u32,
+    f: &D3D12_SUBRESOURCE_FOOTPRINT,
+    rows: &[u8],
+) {
+    let (w, h, depth, pitch) = (
+        f.Width as usize,
+        f.Height as usize,
+        f.Depth as usize,
+        f.RowPitch as usize,
+    );
+    let Some(n) = texel_size(f.Format.0 as u32) else {
+        tracing::info!(format, ?resource, "volume not dumped: format");
+        return;
+    };
+    let slice = pitch * h;
+    // Colour channels only: alpha is the same everywhere in a table.
+    let key = if n >= 4 { n * 3 / 4 } else { n };
+    let (same, pairs) = volume_repeats(rows, [w, h, depth], pitch, n, key);
+    let diagonal: Vec<[f32; 3]> = if f.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        (0..w.min(h).min(depth))
+            .map(|k| {
+                let t = &rows[k * slice + k * pitch + k * n..][..8];
+                [0, 1, 2].map(|c| half(u16::from_le_bytes([t[2 * c], t[2 * c + 1]])))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    tracing::info!(
+        frame,
+        ?resource,
+        width = w,
+        height = h,
+        depth,
+        format,
+        same_along_xyz = ?same,
+        pairs_along_xyz = ?pairs,
+        ?diagonal,
+        "volume texels: neighbours of the same colour along x, y and z, and the grey diagonal"
+    );
+    let wide = w * depth;
+    let mut atlas = Vec::with_capacity(wide * n * h);
+    for y in 0..h {
+        for z in 0..depth {
+            atlas.extend_from_slice(&rows[z * slice + y * pitch..][..w * n]);
+        }
+    }
+    let Some(rgba) = to_rgba(format, wide, h, wide * n, &atlas) else {
+        return;
+    };
+    let mut doubled = Vec::with_capacity(rgba.len() * 4);
+    for row in rgba.chunks_exact(wide * 4) {
+        let line: Vec<u8> = row
+            .chunks_exact(4)
+            .flat_map(|p| [p, p])
+            .flatten()
+            .copied()
+            .collect();
+        doubled.extend_from_slice(&line);
+        doubled.extend_from_slice(&line);
+    }
+    let name = format!("frame-{frame}-{i:02}-{resource:?}-{w}x{h}x{depth}-f{format}-slices");
+    let (out_w, out_h) = ((wide * 2) as u32, (h * 2) as u32);
+    save_as(&name, out_w, out_h, wide * 8, false, &doubled);
 }
 
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
@@ -860,5 +1038,34 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// A 2x2x2 volume of one-byte texels, rows 4 bytes apart: equal
+    /// neighbours are counted per axis, padding is not read.
+    #[test]
+    fn volume_repeats_count_equal_neighbours_per_axis() {
+        // Slice 0: rows [1, 1] and [2, 3]; slice 1: rows [1, 9] and [2, 3].
+        let rows = [
+            1, 1, 0xee, 0xee, 2, 3, 0xee, 0xee, 1, 9, 0xee, 0xee, 2, 3, 0xee, 0xee,
+        ];
+        let (same, pairs) = super::volume_repeats(&rows, [2, 2, 2], 4, 1, 1);
+        assert_eq!(pairs, [4, 4, 4]);
+        // x: (1,1) in slice 0; y: none; z: 1, 2 and 3 repeat.
+        assert_eq!(same, [1, 0, 3]);
+        assert_eq!(super::texel_size(10), Some(8));
+        assert_eq!(super::texel_size(98), None);
+    }
+
+    /// A staircase of 4 steps over 17 entries: few values, many equal
+    /// neighbours, steps of 0.25.
+    #[test]
+    fn curve_summary_tells_a_staircase() {
+        let stairs: Vec<f32> = (0..17).map(|i| (i / 5) as f32 * 0.25).collect();
+        let (distinct, equal, step, samples) = super::curve_summary(&stairs);
+        assert_eq!((distinct, equal, step), (4, 13, 0.25));
+        assert_eq!(samples, stairs);
+        let smooth: Vec<f32> = (0..17).map(|i| i as f32 / 16.0).collect();
+        assert_eq!(super::curve_summary(&smooth).0, 17);
+        assert_eq!(super::curve_summary(&smooth).1, 0);
     }
 }

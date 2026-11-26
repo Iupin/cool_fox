@@ -469,6 +469,8 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV_UINT: u64 = after(17);
+const CLEAR_UAV_FLOAT: u64 = after(18);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -645,6 +647,102 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+impl Front {
+    /// An unordered access view clear (slots 0x1a8, 0x1b0; `float`: the
+    /// values are floats' bits): the record at the CPU handle as it is now
+    /// (the host reads that descriptor at the call; the GPU handle's is read
+    /// when the list runs, and is kept as the handle), the four values and
+    /// the rectangles.
+    #[allow(clippy::too_many_arguments)] // the method's own arguments
+    fn put_clear(
+        &mut self,
+        float: bool,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        values: [u32; 4],
+        count: u32,
+        rects: *const Rect,
+    ) {
+        let count = if rects.is_null() { 0 } else { count };
+        let mut view = [0u64; 2];
+        if cpu != 0 {
+            // SAFETY: a descriptor slot the title passes (32 bytes).
+            unsafe {
+                std::ptr::copy_nonoverlapping(cpu as *const u8, view.as_mut_ptr().cast(), 16)
+            };
+        }
+        let op = if float {
+            CLEAR_UAV_FLOAT
+        } else {
+            CLEAR_UAV_UINT
+        };
+        self.put_with(
+            op,
+            &[u64::from(count), gpu, resource as u64],
+            &[
+                bytes_of(view.as_ptr(), 2),
+                bytes_of(values.as_ptr(), 4),
+                bytes_of(rects, count as usize),
+            ],
+        );
+    }
+}
+
+/// What [`Front::put_clear`] wrote (the words after the op): GPU handle, a
+/// handle of the CPU one's record as it was, resource, values (bits), the
+/// rectangles.
+fn clear_args(w: &[u64]) -> (u64, u64, This, [u32; 4], &[Rect]) {
+    let n = w.first().map_or(0, |&n| n as usize);
+    let values = [
+        w[5] as u32,
+        (w[5] >> 32) as u32,
+        w[6] as u32,
+        (w[6] >> 32) as u32,
+    ];
+    let rects: *const Rect = at(w, 7, n);
+    let rects = if rects.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: `n` rectangles were written there.
+        unsafe { std::slice::from_raw_parts(rects, n) }
+    };
+    (w[1], w[3..].as_ptr() as u64, w[2] as This, values, rects)
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values (null is tolerated).
+    let Some(&v) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    super::clear::called(super::clear::Values::Uint(v), gpu, cpu, resource, count);
+    front(this).put_clear(false, gpu, cpu, resource, v, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values (null is tolerated).
+    let Some(&v) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    super::clear::called(super::clear::Values::Float(v), gpu, cpu, resource, count);
+    front(this).put_clear(true, gpu, cpu, resource, v.map(f32::to_bits), count, rects);
+}
+
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -766,6 +864,15 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV_UINT | CLEAR_UAV_FLOAT => {
+                let (gpu, cpu, resource, values, rects) = clear_args(w);
+                let values = if op == CLEAR_UAV_FLOAT {
+                    super::clear::Values::Float(values.map(f32::from_bits))
+                } else {
+                    super::clear::Values::Uint(values)
+                };
+                super::clear::record(list, gpu, cpu, resource, values, rects);
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -802,7 +909,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -838,6 +945,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -899,9 +1008,82 @@ mod tests {
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
     }
 
+    /// An unordered access view clear comes out as it went in: the GPU
+    /// handle, the CPU handle's record as it was at the call (its slot is
+    /// written again right after), the resource, the values and the
+    /// rectangles.
+    #[test]
+    #[allow(unused_assignments)] // the write after the call is the point: the record must not see it
+    fn a_clear_gives_back_what_was_written() {
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        let mut slot = [0x1122_3344_5566_7788u64, 0x99aa, 3, 4];
+        let rects = [
+            Rect {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+            },
+            Rect {
+                left: 5,
+                top: 6,
+                right: 7,
+                bottom: 8,
+            },
+        ];
+        let resource = 0x1000usize as This;
+        f.put_clear(
+            true,
+            0xabc0,
+            slot.as_ptr() as u64,
+            resource,
+            [1, 2, 3, 0xffff_fffe],
+            2,
+            rects.as_ptr(),
+        );
+        slot[0] = 0;
+        f.put_clear(
+            false,
+            0,
+            0,
+            std::ptr::null(),
+            [9, 8, 7, 6],
+            5,
+            std::ptr::null(),
+        );
+        let s = std::mem::take(&mut f.words);
+        assert_eq!(
+            (s[0] & 0xffff, s[0] >> 16),
+            (CLEAR_UAV_FLOAT, 3 + 2 + 2 + 4)
+        );
+        let (gpu, cpu, r, values, back) = clear_args(&s[1..12]);
+        assert_eq!((gpu, r, values), (0xabc0, resource, [1, 2, 3, 0xffff_fffe]));
+        // SAFETY: two words of the stream.
+        assert_eq!(
+            unsafe { *(cpu as *const [u64; 2]) },
+            [0x1122_3344_5566_7788, 0x99aa]
+        );
+        let back: Vec<[i32; 4]> = back
+            .iter()
+            .map(|r| [r.left, r.top, r.right, r.bottom])
+            .collect();
+        assert_eq!(back, [[1, 2, 3, 4], [5, 6, 7, 8]]);
+        // Without rectangles (none passed): none, whatever the count said.
+        assert_eq!((s[12] & 0xffff, s[12] >> 16), (CLEAR_UAV_UINT, 3 + 2 + 2));
+        let (gpu, cpu, r, values, back) = clear_args(&s[13..]);
+        assert_eq!(
+            (gpu, r, values, back.len()),
+            (0, std::ptr::null(), [9, 8, 7, 6], 0)
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { *(cpu as *const [u64; 2]) }, [0, 0]);
+    }
+
     /// A view's record is the one at the call, also if its slot is written
     /// again right after.
     #[test]
+    #[allow(unused_assignments)] // the write after the call is the point: the record must not see it
     fn a_target_is_the_one_at_the_call() {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);

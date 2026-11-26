@@ -1,5 +1,7 @@
 # Architecture
 
+The overview. Per-subsystem reference is indexed in [README.md](README.md).
+
 ```
  user's files (outside repo)             VIctory
  ───────────────────────────             ─────────────────────────────────────────
@@ -37,7 +39,7 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | the title-specific formats, build identities, hooks |
+| `victory-game` | the place for title-specific formats, build identities and hooks (nearly empty today: no known builds, no hooks) |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
@@ -60,8 +62,11 @@ For every `dll!function` the title imports, in order:
 returns a pseudo handle; `GetProcAddress` on it finds our functions.
 `LoadLibrary*` of a title DLL returns its mapped image, mapping it first if
 nothing imports it. By name, as by import, a title gets only host DLLs
-`HostPolicy` passes through, and `GetProcAddress` on one returns our
-override where import binding would.
+`HostPolicy` passes through (by name the default policy is checked, not the
+run's, so `--strict` does not narrow loads by name), and `GetProcAddress` on
+one returns our override where import binding would. A few host functions
+that write title memory (`memcpy`, `memmove`, `memset`) are bound to
+victory-gpu wrappers instead of the host's, so those writes are seen.
 `QueryApiImpl` hands out our runtime objects by provider and interface id
 (`victory-hle::modules::xgameruntime` lists the areas); online areas answer
 as an offline console. Game saves are files under `VICTORY_DATA_DIR`.
@@ -83,8 +88,13 @@ does not map title DLLs; `victory run` without `--execute` does).
 
 ## Shaders
 
+Stage by stage, with the emit and lowering stages this summary leaves out:
+[crates/victory-shader.md](crates/victory-shader.md).
+
 `victory_shader::ir::build` turns a native program into SSA, one
-instruction per machine instruction. `victory_shader::structure` then
+instruction per machine instruction (scheduling-only instructions and
+branches to the next instruction are dropped; the runtime enters through
+`spill::build`, which also undoes register spills). `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
 a lane can reach them with its EXEC bit clear. `victory_shader::resource`

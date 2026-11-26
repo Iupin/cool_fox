@@ -1189,6 +1189,9 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList_Vtbl.CopyTiles,
         ID3D12GraphicsCommandList_Vtbl.ExecuteBundle,
         ID3D12GraphicsCommandList_Vtbl.SOSetTargets,
+        // Issued for the title's clears (`crate::list::clear`); not kept: the
+        // view is named by a CPU handle in a heap the card does not see,
+        // which a recording has no slot kind for (`docs/replay.md`, limits).
         ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewUint,
         ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat,
         ID3D12GraphicsCommandList_Vtbl.SetPredication,
