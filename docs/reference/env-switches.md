@@ -24,7 +24,8 @@ explained in a comment where it is read, and this page quotes that comment.
 322 + 30 + 1 = 353 names in `.rs`; + 1 doc-only = 354. (The six
 `VICTORY_WRITERS*` names were added on 2026-11-26 without re-running the
 classification; `crates/victory-gpu/src/writers.rs` counts once it is
-tracked.)
+tracked. `VICTORY_MEMORY_FAULT_MB`, added later that day, is not counted
+either.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -209,7 +210,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_CAPTURE_FRAMES` | `crates/victory-gpu/src/capture.rs:25` | number | Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved too, and their draws traced at debug level. | neither |
 | `VICTORY_CAPTURE_WORLD` | `crates/victory-gpu/src/capture.rs:120` | true if set (any value); diag build | Whether `VICTORY_CAPTURE_WORLD` is set. | neither |
 | `VICTORY_CAPTURE_WORLD_ALSO` | `crates/victory-gpu/src/capture.rs:43` | number | `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted from that first one (the title's blue patches show from about the 118th frame on, when the window's model has arrived and the reflections hold values: none of ... | neither |
-| `VICTORY_DUMP_TARGETS` | `crates/victory-gpu/src/capture.rs:361` | on if set and not `0` | With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png` (what each ...). 1D tables of 32-bit floats logged as numbers (distinct values, equal neighbours, largest step, 17 samples); 3D textures (colour look-up tables) as their slices side by side, each texel doubled, `...-<w>x<h>x<d>-f<format>-slices.png`, with a log line counting equal neighbours along x, y and z and listing the grey diagonal | neither |
+| `VICTORY_DUMP_TARGETS` | `crates/victory-gpu/src/capture.rs:361` | on if set and not `0` | With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png` (what each ...). 1D tables of 32-bit floats logged as numbers (distinct values, equal neighbours, largest step, 17 samples); 3D textures (colour look-up tables) as their slices side by side, each texel doubled, `...-<w>x<h>x<d>-f<format>-slices.png`, with a log line counting equal neighbours along x, y and z and listing the grey diagonal. Float targets (R32G32B32A32, R32G32, R32/D32, R16G16B16A16, R16G16, R16 floats and R11G11B10; not typeless ones): a WARN `target values: texels with a NaN, +Inf or -Inf channel, or a huge one, ...` with the counts and boxes when there are any (huge: at least 1e6 for 32-bit floats, the largest value for the smaller ones), and per frame one line `dumped targets: the first in dump order with non-finite or huge texels ...` (WARN) or `... no float target has non-finite or huge texels` (INFO) | neither |
 
 ### victory-gpu / copystat (3)
 
@@ -391,13 +392,14 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_THIN_THREADS` | `crates/victory-gpu/src/list/thin.rs:303` | number; default `8usize` | module: | neither |
 | `VICTORY_WAIT_ASK` | `crates/victory-gpu/src/list.rs:2007` | true only if `1` | `VICTORY_WAIT_ASK=1` asks first, as before. | neither |
 
-### victory-gpu / memory (3)
+### victory-gpu / memory (4)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
-| `VICTORY_BVH_SIZES_WAIT` | `crates/victory-gpu/src/memory.rs:819` | true only if `1` | Whether a submission that asks for the sizes of structures is waited for, and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off). | neither |
-| `VICTORY_BVH_TRACE` | `crates/victory-gpu/src/memory.rs:1091` | true only if `1` | `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of one thread that stores a structure's compacted size) and when title memory has them, and the copies to a place of that size. | neither |
-| `VICTORY_MEMORY_DUMP` | `crates/victory-gpu/src/memory.rs:1197` | path; unset = off | `VICTORY_MEMORY_DUMP=<folder>`: when a file `go` appears there, the arenas as the card holds them are copied out and written (`arena-<n>.bin`), with `pages.txt` (title page, arena, offset) and the structures the walking ... | neither |
+| `VICTORY_BVH_SIZES_WAIT` | `crates/victory-gpu/src/memory.rs:1256` | true only if `1` | Whether a submission that asks for the sizes of structures is waited for, and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off). | neither |
+| `VICTORY_BVH_TRACE` | `crates/victory-gpu/src/memory.rs:1528` | true only if `1` | `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of one thread that stores a structure's compacted size) and when title memory has them, and the copies to a place of that size. | neither |
+| `VICTORY_MEMORY_FAULT_MB` | `crates/victory-gpu/src/memory.rs:916` | MiB; default an eighth of `VICTORY_MEMORY_CARD_MB` (512 MiB, 8,192 pages); at least 64, at most 3 GiB less the builder's spare | Pages of title memory by address made because shaders found them without a copy (faults), held at a time; past it the one made longest ago is given back for a new one (none held fewer than 8 frames). At most 128 are made a frame. Added 2026-11-26 in place of a cap of 2,048 for the whole run. | neither |
+| `VICTORY_MEMORY_DUMP` | `crates/victory-gpu/src/memory.rs:1634` | path; unset = off | `VICTORY_MEMORY_DUMP=<folder>`: when a file `go` appears there, the arenas as the card holds them are copied out and written (`arena-<n>.bin`), with `pages.txt` (title page, arena, offset) and the structures the walking ... | neither |
 
 ### victory-gpu / picked (2)
 
@@ -513,7 +515,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_KEEP_SNAPSHOTS` | `crates/victory-gpu/src/shadow.rs:2713` | true only if `1` | Whether a copy's snapshot is kept from one submission to the next and only the pieces that changed in between are taken again (`VICTORY_KEEP_SNAPSHOTS=1`; off by default). | neither |
 | `VICTORY_KEEP_SNAPSHOTS_MB` | `crates/victory-gpu/src/shadow.rs:2724` | u64; default `256` | `VICTORY_KEEP_SNAPSHOTS_MB`, 256 unless set (it was 768: run 80, with kept snapshots beside copies in the card's memory, ran the PC out of memory in 27 s; kept snapshots are the PC's memory, all of it resident). | neither |
 | `VICTORY_LAND_ECHO` | `crates/victory-gpu/src/shadow.rs:2204` | default ON; `0` off | Whether a refresh looks if what counts as written is only what a landing put there, and then sends nothing of it up (`VICTORY_LAND_ECHO=0`: it copies and sends it, as before). | play.ps1=`0 (-Safe)` |
-| `VICTORY_MEMORY_CARD_MB` | `crates/victory-gpu/src/shadow.rs:5384` | u64; default `4096` | At most so much on the card's own memory (4 GiB unless `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past that the side shaders see is in the PC's memory. | neither |
+| `VICTORY_MEMORY_CARD_MB` | `crates/victory-gpu/src/shadow.rs:5375` | u64; default `4096` | At most so much of title memory by address on the card's own memory (4 GiB unless `VICTORY_MEMORY_CARD_MB` says otherwise), and while the card's use stays under 97 % of its budget; past that the side shaders see is in the PC's memory. An eighth of it is the default of `VICTORY_MEMORY_FAULT_MB`. | neither |
 | `VICTORY_QUICK_FIND` | `crates/victory-gpu/src/shadow.rs:4971` | default ON; `0` off | Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not). | neither |
 | `VICTORY_REFRESH_CHECK` | `crates/victory-gpu/src/shadow.rs:3978` | true only if `1` | Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a refresh of `[from, to)` that trusted the write watch or the guards, the first 256 bytes of every 64 KiB block of it are read from title memory and compared with ... | neither |
 | `VICTORY_SEND_CHANGED` | `crates/victory-gpu/src/shadow.rs:2247` | true if set and not `0`; diag build | Whether a refresh of a copy in the card's memory takes, and sends up, the dwords that title memory changed and no others (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last took them, whole). | neither |

@@ -24,7 +24,10 @@
 //!   copy);
 //! - the **faults**: the page numbers shaders found empty, read back here
 //!   once a frame, so the pages are there from the next frame on. A pointer a
-//!   shader takes out of memory cannot be known before it runs.
+//!   shader takes out of memory cannot be known before it runs. Pages made
+//!   for faults are bounded a frame and held at a time, and the one made
+//!   longest ago is given back for a new one ([`FaultPages`]), so a run of
+//!   wild rays cannot use them up for good.
 //!
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
@@ -62,7 +65,9 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
-//! shortcut: a page held for anything else is kept for the rest of the run.
+//! shortcut: a page held for anything else (named by a list, a packed
+//! structure's, or made for a fault and named since) is kept for the rest of
+//! the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
@@ -101,11 +106,23 @@ const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
-/// Pages taken from the faults, of one frame and in all, at most: a ray in a
-/// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// Pages taken from the faults of one frame, at most, and the title pages
+/// looked at for them: a ray in a structure that is not right goes
+/// anywhere, and 2,048 a frame took all the pages there are in the first
+/// seconds (run light-4). How many are held at a time is bounded too
+/// ([`fault_limits`], [`FaultPages`]); until 2026-11-26 it was 2,048 for the
+/// whole run, used up some 45 frames after the world appeared.
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULT_TRIES: usize = 1024;
+/// A page made from a fault is not given back for another before it was
+/// held so many frames.
+const FAULT_FRESH: u64 = 8;
+/// For so long every frame's faults were not all given a copy before it is
+/// warned.
+const STARVING: std::time::Duration = std::time::Duration::from_secs(5);
+/// The lowest title page a fault may name (4 GiB; lower ones are pointers
+/// read as zero and the like).
+const LOWEST: u64 = 0x1_0000;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -132,6 +149,9 @@ struct Held {
     /// them alone.
     owners: u32,
     theirs: bool,
+    /// Made from a fault and not named since: its number among those
+    /// ([`FaultPages`]); such a page can be given back for another.
+    fault: Option<u64>,
 }
 
 /// A packed structure the builder came to.
@@ -170,7 +190,7 @@ struct Memory {
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
-    faulted: usize,
+    faulted: FaultPages,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -234,6 +254,15 @@ impl Memory {
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        let limits = fault_limits();
+        tracing::info!(
+            "title memory by address: pages for faults: at most {} made a frame ({} title pages tried), {} held at a time ({} MiB), \
+             the one made longest ago given back for a new one when that many are held or the card has no room",
+            limits.per_frame,
+            limits.tries,
+            limits.most,
+            (limits.most as u64 * PAGE) >> 20
+        );
         Some(Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
@@ -249,7 +278,7 @@ impl Memory {
             packed_sweep: 0,
             free: Vec::new(),
             open: Default::default(),
-            faulted: 0,
+            faulted: FaultPages::default(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -283,7 +312,7 @@ impl Memory {
     fn possible(&mut self, page: u64) -> bool {
         // Not the last entry: addresses past the directory read it, and it
         // stays empty.
-        if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+        if page < LOWEST || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
             return false;
         }
         let at = (page * PAGE) as usize;
@@ -322,19 +351,47 @@ impl Memory {
     /// whether it has one then.
     fn map(&mut self, page: u64) -> bool {
         if self.copy_of(page).is_some() {
+            // Named: no longer one of the pages for faults.
+            if let Some(held) = self.pages.get_mut(&page)
+                && held.fault.take().is_some()
+            {
+                self.faulted.named();
+            }
             return true;
         }
         if !self.possible(page) {
             return false;
         }
+        if let Some(made) = self.in_buffers(page) {
+            return made;
+        }
+        if self.pages.len() >= MOST {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            return false;
+        }
+        if self.free.is_empty() && !self.another() {
+            return false;
+        }
+        let Some((copy, at)) = self.free.pop() else {
+            return false;
+        };
+        self.hold(page, at, copy);
+        true
+    }
+
+    /// [`Memory::map`] of a page that a title buffer's copy holds, or that
+    /// is a window of title memory with small title buffers in it: whether
+    /// it has a copy then. None for a page that needs an arena's.
+    fn in_buffers(&mut self, page: u64) -> Option<bool> {
         let start = page * PAGE;
         if crate::shadow::in_buffer(start, PAGE).is_some() {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
-                return false;
+                return Some(false);
             };
             let fresh = !self.numbers.contains_key(&(Arc::as_ptr(&shadow) as usize));
             let Some(n) = self.number(shadow.clone()) else {
-                return false;
+                return Some(false);
             };
             // Every page the copy holds whole, not only the one asked for.
             // shortcut: a page of a title buffer inside this one that has a
@@ -355,7 +412,7 @@ impl Memory {
             if unsafe { self.entry(page).read() } == 0 {
                 close(self.entry(page), n, start - shadow.span().0);
             }
-            return true;
+            return Some(true);
         }
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
@@ -365,27 +422,11 @@ impl Memory {
             {
                 self.windows += 1;
                 fill(self.entry(page), n, 0);
-                return true;
+                return Some(true);
             }
-            return false;
+            return Some(false);
         }
-        if self.pages.len() >= MOST {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
-            return false;
-        }
-        if let Some((copy, at)) = self.free.pop() {
-            self.hold(page, at, copy);
-            return true;
-        }
-        if !self.another() {
-            return false;
-        }
-        let Some((copy, at)) = self.free.pop() else {
-            return false;
-        };
-        self.hold(page, at, copy);
-        true
+        None
     }
 
     /// Another arena's pages.
@@ -404,9 +445,20 @@ impl Memory {
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
-        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
+        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false, fault: None });
         self.order.push(page);
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+    }
+
+    /// `page`'s place in its arena is given back: shaders find no copy of it
+    /// from the next submission on (lists already sent read what the place
+    /// holds, as when a packed structure goes).
+    fn let_go(&mut self, page: u64) {
+        if let Some(held) = self.pages.remove(&page) {
+            self.free.push((held.copy, held.at));
+            // SAFETY: an entry of the directory, under the mutex.
+            unsafe { self.entry(page).write_volatile(0) };
+        }
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -417,10 +469,7 @@ impl Memory {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
-                self.free.push((held.copy, held.at));
-                self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+                self.let_go(page);
             }
         }
         self.stats.gone += 1;
@@ -598,6 +647,9 @@ impl Memory {
                 if let Some(held) = self.pages.get_mut(&page) {
                     held.owners += 1;
                     held.theirs |= new;
+                    if held.fault.take().is_some() {
+                        self.faulted.named();
+                    }
                 }
             }
             self.stats.packed_bytes += len;
@@ -670,17 +722,30 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
+        pages.sort_unstable();
+        let limits = fault_limits();
+        // (Out for the time: it asks this memory for pages.)
+        let mut faulted = std::mem::take(&mut self.faulted);
+        let t = faulted.take(&pages, self.frame, limits, self);
+        let starving = faulted.watch(&t, std::time::Instant::now());
+        let from_faults = faulted.held;
+        self.faulted = faulted;
+        if let Some(since) = starving {
+            tracing::warn!(
+                "title memory by address: for {:.0} s every frame's shaders touched title pages that could not all be given a copy \
+                 (those reads give 0 and those stores are dropped until they have one); in the last frame {} past the limit of {} a frame, \
+                 {} at the limit of {} held, {} for room on the card; binding: {}",
+                since.as_secs_f64(),
+                t.capped,
+                limits.per_frame,
+                t.held_limit,
+                limits.most,
+                t.no_room,
+                t.binding()
+            );
+        }
         if pages.is_empty() {
             return;
-        }
-        pages.sort_unstable();
-        let mut made = 0;
-        for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                self.bring(page, page + 1);
-            }
         }
         self.stats.faults += pages.len() as u64;
         // Each is an access that read 0 or was dropped.
@@ -695,10 +760,20 @@ impl Memory {
             tracing::warn!(
                 frame = self.frame,
                 pages = pages.len(),
-                made,
+                made = t.made,
+                there = t.there,
+                wild = t.wild,
+                not_title = t.not_title,
+                capped = t.capped,
+                held_limit = t.held_limit,
+                no_room = t.no_room,
+                failed = t.failed,
+                given_back = t.given_back,
                 held = self.pages.len(),
+                from_faults,
                 ?some,
-                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
+                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); \
+                 `made` of them have one now, the others not the title's (`wild`, `not_title`) or tried again when touched again"
             );
         }
     }
@@ -765,7 +840,7 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, made from faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -787,9 +862,371 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted.all
         );
+        let f = std::mem::take(&mut self.faulted.tally);
+        if f.asked > 0 {
+            let limits = fault_limits();
+            tracing::info!(
+                "title memory by address: pages for faults since the last line, over {} frames: {} asked, {} made, {} given back \
+                 (made longest ago first); not made: {} past the limit of {} a frame, {} at the limit of {} held, {} for room on the card, \
+                 {} failed, {} not the title's memory, {} outside it (wild); {} already had one; {} held for faults now; \
+                 {} frames short; binding: {}",
+                f.frames,
+                f.asked,
+                f.made,
+                f.given_back,
+                f.capped,
+                limits.per_frame,
+                f.held_limit,
+                limits.most,
+                f.no_room,
+                f.failed,
+                f.not_title,
+                f.wild,
+                f.there,
+                self.faulted.held,
+                f.starved,
+                f.binding()
+            );
+        }
         self.stats.from = Some((now, self.frame));
+    }
+}
+
+/// The limits of [`FaultPages`].
+#[derive(Clone, Copy)]
+struct FaultLimits {
+    /// Pages made a frame, title pages tried a frame.
+    per_frame: usize,
+    tries: usize,
+    /// Pages held for faults at a time.
+    most: usize,
+    /// Frames a page is held at least before it can be given back.
+    fresh: u64,
+}
+
+/// [`FaultLimits`] of this run: [`FAULTS`] and [`FAULT_TRIES`] a frame, and
+/// `VICTORY_MEMORY_FAULT_MB` of pages held at a time (unset: an eighth of
+/// `VICTORY_MEMORY_CARD_MB`, 512 MiB, 8,192 pages, by default; at least
+/// one arena's, 64 MiB, and at most what leaves [`SPARE`] of [`MOST`]).
+fn fault_limits() -> FaultLimits {
+    static MOST_HELD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let most = *MOST_HELD.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_FAULT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let mb = mb.unwrap_or((crate::shadow::by_address_card_most() >> 20) / 8);
+        ((mb << 20) / PAGE).clamp(ARENA / PAGE, (MOST - SPARE) as u64) as usize
+    });
+    FaultLimits { per_frame: FAULTS, tries: FAULT_TRIES, most, fresh: FAULT_FRESH }
+}
+
+/// What became of a frame's faults (or of the frames since the last report):
+/// `asked` is `there + made + wild + not_title + capped + held_limit +
+/// no_room + failed`.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct FaultTally {
+    frames: u64,
+    /// Pages shaders found without a copy.
+    asked: u64,
+    /// Had one by the time they were looked at.
+    there: u64,
+    made: u64,
+    /// Outside title memory's range (below 4 GiB, past the directory): no
+    /// pointer of the title's, nothing spent on them.
+    wild: u64,
+    /// In the range but not the title's memory (not committed, not watched).
+    not_title: u64,
+    /// Past the limit of a frame (made or tried): tried again next frame.
+    capped: u64,
+    /// At the limit of pages held, with none old enough to give back.
+    held_limit: u64,
+    /// No free place, the card without room for another arena and none to
+    /// give back.
+    no_room: u64,
+    /// A copy that could not be made (memory of the PC, numbers).
+    failed: u64,
+    /// Pages for faults given back for new ones.
+    given_back: u64,
+    /// Frames in which title pages were left without a copy for a limit.
+    starved: u64,
+}
+
+impl FaultTally {
+    fn add(&mut self, t: &FaultTally) {
+        self.frames += t.frames;
+        self.asked += t.asked;
+        self.there += t.there;
+        self.made += t.made;
+        self.wild += t.wild;
+        self.not_title += t.not_title;
+        self.capped += t.capped;
+        self.held_limit += t.held_limit;
+        self.no_room += t.no_room;
+        self.failed += t.failed;
+        self.given_back += t.given_back;
+        self.starved += t.starved;
+    }
+
+    /// Whether title pages were left without a copy for a limit.
+    fn short(&self) -> bool {
+        self.capped + self.held_limit + self.no_room > 0
+    }
+
+    /// The limit that left most pages without a copy.
+    fn binding(&self) -> &'static str {
+        let most = self.capped.max(self.held_limit).max(self.no_room);
+        if most == 0 {
+            "none"
+        } else if most == self.capped {
+            "the limit of a frame"
+        } else if most == self.held_limit {
+            "the limit of pages held"
+        } else {
+            "room on the card"
+        }
+    }
+}
+
+/// What [`Keeper::grow`] did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Grown {
+    Yes,
+    /// The card has no room for another arena (or the cap is reached).
+    NoRoom,
+    /// All the pages there may be are held or free ([`MOST`]).
+    Full,
+    Failed,
+}
+
+/// What [`FaultPages::take`] asks of the memory that holds the pages
+/// ([`Memory`]; a plain one in the tests).
+trait Keeper {
+    /// Whether `page` has a copy.
+    fn has(&self, page: u64) -> bool;
+    /// Whether `page` is the title's memory.
+    fn title(&mut self, page: u64) -> bool;
+    /// A copy of `page` that is not an arena's page (a title buffer's, a
+    /// window): whether it was made; None if it needs an arena's.
+    fn other_copy(&mut self, page: u64) -> Option<bool>;
+    /// Whether as many pages are held as there may be.
+    fn full(&self) -> bool;
+    /// Whether a free place is left beyond those kept for the builder.
+    fn spare(&self) -> bool;
+    /// Another arena's free places, only on the card.
+    fn grow(&mut self) -> Grown;
+    /// `page` in a free place, numbered `number` among the pages for faults.
+    fn make(&mut self, page: u64, number: u64) -> bool;
+    /// The number of `page` if it is held for faults.
+    fn number(&self, page: u64) -> Option<u64>;
+    fn give_back(&mut self, page: u64);
+}
+
+/// Pages given a copy because shaders found them without one (the faults).
+/// At most [`FaultLimits::per_frame`] are made a frame, and at most
+/// [`FaultLimits::most`] are held: past that, or when a new one would need
+/// another arena and the card has no room for one, the page made longest
+/// ago is given back for it (none held fewer than [`FaultLimits::fresh`]
+/// frames). Shaders do not say which pages that have a copy they touch, so
+/// "longest ago" is the order they were made in: a page given back that
+/// shaders still use faults again and comes back. A page named since (by a
+/// view, a constant, a packed structure) is held for that and no longer
+/// counted here.
+#[derive(Default)]
+struct FaultPages {
+    /// In the order they were made: the page, its number, the frame.
+    made: std::collections::VecDeque<(u64, u64, u64)>,
+    /// How many of them are held for faults now.
+    held: usize,
+    /// The last number given.
+    number: u64,
+    /// Where the next frame's tries start among its faults.
+    turn: usize,
+    /// Made in all.
+    all: u64,
+    /// Since the last report.
+    tally: FaultTally,
+    /// Since when every frame was short ([`FaultTally::short`]), and
+    /// whether it was said.
+    starving: Option<std::time::Instant>,
+    warned: bool,
+}
+
+impl FaultPages {
+    /// A page held for faults was named.
+    fn named(&mut self) {
+        self.held = self.held.saturating_sub(1);
+    }
+
+    /// Gives back the page made longest ago if it was held long enough.
+    fn give_back_oldest(&mut self, frame: u64, fresh: u64, keeper: &mut impl Keeper) -> bool {
+        while let Some(&(page, number, made)) = self.made.front() {
+            if keeper.number(page) != Some(number) {
+                self.made.pop_front();
+                continue;
+            }
+            if made + fresh > frame {
+                return false;
+            }
+            self.made.pop_front();
+            keeper.give_back(page);
+            self.held = self.held.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
+    /// The faults of frame `frame` (sorted): pages made for those that are
+    /// the title's, within the limits.
+    fn take(&mut self, pages: &[u64], frame: u64, limits: FaultLimits, keeper: &mut impl Keeper) -> FaultTally {
+        let mut t = FaultTally { frames: 1, asked: pages.len() as u64, ..FaultTally::default() };
+        // Entries of pages given back or named since.
+        if self.made.len() > 2 * self.held + 4096 {
+            self.made.retain(|&(page, number, _)| keeper.number(page) == Some(number));
+        }
+        let start = self.turn % pages.len().max(1);
+        let mut tried = 0;
+        // Once an arena could not be made, not asked again this frame.
+        let mut not_grown = None;
+        for k in 0..pages.len() {
+            let page = pages[(start + k) % pages.len()];
+            if !(LOWEST..u64::from(MEMORY_PAGES) - 1).contains(&page) {
+                t.wild += 1;
+                continue;
+            }
+            if keeper.has(page) {
+                t.there += 1;
+                continue;
+            }
+            if t.made as usize >= limits.per_frame || tried >= limits.tries {
+                t.capped += 1;
+                continue;
+            }
+            tried += 1;
+            if !keeper.title(page) {
+                t.not_title += 1;
+                continue;
+            }
+            match keeper.other_copy(page) {
+                Some(true) => {
+                    t.made += 1;
+                    continue;
+                }
+                Some(false) => {
+                    t.failed += 1;
+                    continue;
+                }
+                None => {}
+            }
+            let mut freed = false;
+            if self.held >= limits.most || keeper.full() {
+                if !self.give_back_oldest(frame, limits.fresh, keeper) {
+                    t.held_limit += 1;
+                    continue;
+                }
+                t.given_back += 1;
+                freed = true;
+            }
+            if !freed && !keeper.spare() {
+                let grown = not_grown.unwrap_or_else(|| keeper.grow());
+                if grown != Grown::Yes {
+                    not_grown = Some(grown);
+                    if self.give_back_oldest(frame, limits.fresh, keeper) {
+                        t.given_back += 1;
+                    } else {
+                        match grown {
+                            Grown::NoRoom => t.no_room += 1,
+                            Grown::Full => t.held_limit += 1,
+                            _ => t.failed += 1,
+                        }
+                        continue;
+                    }
+                }
+            }
+            self.number += 1;
+            if keeper.make(page, self.number) {
+                self.made.push_back((page, self.number, frame));
+                self.held += 1;
+                self.all += 1;
+                t.made += 1;
+            } else {
+                t.failed += 1;
+            }
+        }
+        // Next frame the tries start further on: pages left out now go first.
+        self.turn = self.turn.wrapping_add(tried);
+        t.starved = u64::from(t.short());
+        self.tally.add(&t);
+        t
+    }
+
+    /// After a frame's [`FaultPages::take`]: how long every frame has been
+    /// short, once it has been for [`STARVING`] (once until a frame is not).
+    fn watch(&mut self, t: &FaultTally, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !t.short() {
+            self.starving = None;
+            self.warned = false;
+            return None;
+        }
+        let since = now.duration_since(*self.starving.get_or_insert(now));
+        if self.warned || since < STARVING {
+            return None;
+        }
+        self.warned = true;
+        Some(since)
+    }
+}
+
+impl Keeper for Memory {
+    fn has(&self, page: u64) -> bool {
+        self.copy_of(page).is_some()
+    }
+
+    fn title(&mut self, page: u64) -> bool {
+        self.possible(page)
+    }
+
+    fn other_copy(&mut self, page: u64) -> Option<bool> {
+        self.in_buffers(page)
+    }
+
+    fn full(&self) -> bool {
+        self.pages.len() >= MOST
+    }
+
+    fn spare(&self) -> bool {
+        self.free.len() > SPARE
+    }
+
+    fn grow(&mut self) -> Grown {
+        if self.pages.len() + self.free.len() + (ARENA / PAGE) as usize > MOST {
+            Grown::Full
+        } else if !crate::shadow::by_address_on_card(ARENA) {
+            Grown::NoRoom
+        } else if self.another() {
+            Grown::Yes
+        } else {
+            Grown::Failed
+        }
+    }
+
+    fn make(&mut self, page: u64, number: u64) -> bool {
+        let Some((copy, at)) = self.free.pop() else {
+            return false;
+        };
+        self.hold(page, at, copy);
+        if let Some(held) = self.pages.get_mut(&page) {
+            held.fault = Some(number);
+        }
+        self.bring(page, page + 1);
+        true
+    }
+
+    fn number(&self, page: u64) -> Option<u64> {
+        self.pages.get(&page).and_then(|h| h.fault)
+    }
+
+    fn give_back(&mut self, page: u64) {
+        self.let_go(page);
     }
 }
 
@@ -1300,5 +1737,216 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    /// Memory of the test's own that holds pages for [`FaultPages`]: pages
+    /// are the title's unless listed in `not_title`; places come by arenas of
+    /// 1,024 while `room`.
+    #[derive(Default)]
+    struct Plain {
+        held: HashMap<u64, Option<u64>>,
+        not_title: std::collections::HashSet<u64>,
+        /// Pages a title buffer's copy holds.
+        buffers: std::collections::HashSet<u64>,
+        free: usize,
+        room: bool,
+        most: usize,
+        given_back: Vec<u64>,
+        tried: Vec<u64>,
+    }
+
+    impl Keeper for Plain {
+        fn has(&self, page: u64) -> bool {
+            self.held.contains_key(&page)
+        }
+        fn title(&mut self, page: u64) -> bool {
+            self.tried.push(page);
+            !self.not_title.contains(&page)
+        }
+        fn other_copy(&mut self, page: u64) -> Option<bool> {
+            self.buffers.contains(&page).then(|| {
+                self.held.insert(page, None);
+                true
+            })
+        }
+        fn full(&self) -> bool {
+            self.held.len() >= self.most
+        }
+        fn spare(&self) -> bool {
+            self.free > 0
+        }
+        fn grow(&mut self) -> Grown {
+            if !self.room {
+                return Grown::NoRoom;
+            }
+            self.free += 1024;
+            Grown::Yes
+        }
+        fn make(&mut self, page: u64, number: u64) -> bool {
+            if self.free == 0 {
+                return false;
+            }
+            self.free -= 1;
+            self.held.insert(page, Some(number));
+            true
+        }
+        fn number(&self, page: u64) -> Option<u64> {
+            self.held.get(&page).copied().flatten()
+        }
+        fn give_back(&mut self, page: u64) {
+            self.held.remove(&page);
+            self.free += 1;
+            self.given_back.push(page);
+        }
+    }
+
+    fn plain() -> Plain {
+        Plain { room: true, most: MOST, ..Plain::default() }
+    }
+
+    fn limits(per_frame: usize, most: usize) -> FaultLimits {
+        FaultLimits { per_frame, tries: FAULT_TRIES, most, fresh: FAULT_FRESH }
+    }
+
+    /// Title pages from 4 GiB on.
+    const T: u64 = LOWEST + 0x100;
+
+    fn sums(t: &FaultTally) -> u64 {
+        t.there + t.made + t.wild + t.not_title + t.capped + t.held_limit + t.no_room + t.failed
+    }
+
+    /// Far more than the 2,048 pages the run used to be given in all: a page
+    /// touched after them still gets a copy, a frame's limit and the limit
+    /// held hold throughout.
+    #[test]
+    fn faults_get_pages_for_the_whole_run() {
+        let (mut f, mut m, l) = (FaultPages::default(), plain(), limits(128, 4096));
+        for frame in 0..400u64 {
+            // 300 pages a frame never touched before: 120,000 in all.
+            let pages: Vec<u64> = (0..300).map(|i| T + frame * 300 + i).collect();
+            let t = f.take(&pages, frame, l, &mut m);
+            assert_eq!(t.made, 128, "frame {frame}");
+            assert_eq!(t.capped, 300 - 128);
+            assert_eq!(sums(&t), t.asked);
+            assert!(f.held <= l.most && m.held.len() <= l.most);
+        }
+        assert_eq!(f.all, 400 * 128);
+        assert_eq!(f.held, l.most);
+        // Once full, a page for each new one, the oldest first.
+        assert_eq!(m.given_back.len(), 400 * 128 - l.most);
+        assert_eq!(m.given_back[0], T);
+        // A page touched now is there from the next frame on.
+        let late = T + 500_000;
+        let t = f.take(&[late], 400, l, &mut m);
+        assert_eq!((t.made, t.given_back), (1, 1));
+        assert!(m.has(late));
+        // A frame's faults left out by its limit come first in the next.
+        let pages: Vec<u64> = (0..300).map(|i| T + 600_000 + i).collect();
+        f.take(&pages, 401, l, &mut m);
+        let t = f.take(&pages, 402, l, &mut m);
+        assert_eq!((t.there, t.made), (128, 128));
+        let t = f.take(&pages, 403, l, &mut m);
+        assert_eq!((t.there, t.made), (256, 300 - 256));
+        assert!(pages.iter().all(|&p| m.has(p)));
+        assert_eq!(f.tally.frames, 404);
+    }
+
+    /// At the limit held, the page made longest ago goes first; none goes
+    /// before it was held [`FAULT_FRESH`] frames, nor a page named since.
+    #[test]
+    fn the_oldest_pages_for_faults_go_first() {
+        let (mut f, mut m, l) = (FaultPages::default(), plain(), limits(128, 3));
+        for frame in 0..3 {
+            f.take(&[T + frame], frame, l, &mut m);
+        }
+        // Too soon: nothing given back, the page is left for later.
+        let t = f.take(&[T + 10], 3, l, &mut m);
+        assert_eq!((t.made, t.held_limit, t.given_back), (0, 1, 0));
+        assert_eq!(t.binding(), "the limit of pages held");
+        // The first page is named by a list: held for that, not for faults.
+        m.held.insert(T, None);
+        f.named();
+        assert_eq!(f.held, 2);
+        let t = f.take(&[T + 10], 3 + FAULT_FRESH, l, &mut m);
+        assert_eq!((t.made, t.given_back), (1, 0));
+        let t = f.take(&[T + 11, T + 12], 3 + FAULT_FRESH, l, &mut m);
+        assert_eq!((t.made, t.given_back), (2, 2));
+        assert_eq!(m.given_back, [T + 1, T + 2]);
+        assert!(m.has(T) && m.has(T + 10) && m.has(T + 11) && m.has(T + 12));
+        assert_eq!(f.held, 3);
+    }
+
+    /// Faults outside title memory spend neither a frame's pages nor its
+    /// tries; those inside it that are not the title's spend tries alone.
+    #[test]
+    fn wild_faults_spend_nothing() {
+        let (mut f, mut m, l) = (FaultPages::default(), plain(), limits(4, 64));
+        // Below 4 GiB, past the directory, and some in range.
+        let mut pages: Vec<u64> = (1..5000).chain([u64::from(MEMORY_PAGES) - 1, u64::from(MEMORY_PAGES) + 7]).collect();
+        m.not_title.extend((0..10).map(|i| T + i));
+        pages.extend((0..14).map(|i| T + i));
+        pages.sort_unstable();
+        let t = f.take(&pages, 0, l, &mut m);
+        assert_eq!((t.wild, t.not_title, t.made, t.capped), (5001, 10, 4, 0));
+        assert_eq!(sums(&t), t.asked);
+        assert_eq!(m.tried.len(), 14);
+        assert!((10..14).all(|i| m.has(T + i)));
+        assert_eq!(t.binding(), "none");
+        assert!(!t.short());
+        // Tries are bounded too.
+        let mut m = plain();
+        m.not_title.extend((0..5000).map(|i| T + i));
+        let pages: Vec<u64> = (0..5000).map(|i| T + i).collect();
+        let t = f.take(&pages, 1, l, &mut m);
+        assert_eq!((t.not_title, t.capped, t.made), (FAULT_TRIES as u64, 5000 - FAULT_TRIES as u64, 0));
+    }
+
+    /// No room on the card: free places and given-back ones are used, else
+    /// the page is refused for room and made when there is room again.
+    #[test]
+    fn no_room_is_tried_again() {
+        let (mut f, mut m, l) = (FaultPages::default(), plain(), limits(128, 1024));
+        m.room = false;
+        let t = f.take(&[T], 0, l, &mut m);
+        assert_eq!((t.made, t.no_room), (0, 1));
+        assert_eq!(t.binding(), "room on the card");
+        m.room = true;
+        let t = f.take(&[T], 1, l, &mut m);
+        assert_eq!((t.made, t.no_room), (1, 0));
+        // The arena's other places, then the oldest pages for faults.
+        m.room = false;
+        let pages: Vec<u64> = (1..1024).map(|i| T + i).collect();
+        let t = f.take(&pages[..127], 2, l, &mut m);
+        assert_eq!(t.made, 127);
+        for (frame, chunk) in (3..).zip(pages[127..].chunks(128)) {
+            f.take(chunk, frame, l, &mut m);
+        }
+        assert_eq!((m.free, f.held), (0, 1024));
+        let t = f.take(&[T + 5000], 100, l, &mut m);
+        assert_eq!((t.made, t.given_back, t.no_room), (1, 1, 0));
+        assert_eq!(m.given_back, [T]);
+        // Pages in title buffers take no place.
+        m.buffers.insert(T + 6000);
+        let t = f.take(&[T + 6000], 101, l, &mut m);
+        assert_eq!((t.made, t.given_back), (1, 0));
+        assert_eq!(f.held, 1024);
+    }
+
+    /// Frames short of pages for [`STARVING`] are warned once, again only
+    /// after a frame that was not.
+    #[test]
+    fn being_short_for_long_is_said_once() {
+        let mut f = FaultPages::default();
+        let short = FaultTally { capped: 3, ..FaultTally::default() };
+        let start = std::time::Instant::now();
+        let at = |s: f64| start + std::time::Duration::from_secs_f64(s);
+        assert_eq!(f.watch(&short, at(0.0)), None);
+        assert_eq!(f.watch(&short, at(4.9)), None);
+        assert!(f.watch(&short, at(5.1)).is_some_and(|d| d.as_secs_f64() > 5.0));
+        assert_eq!(f.watch(&short, at(9.0)), None);
+        assert_eq!(f.watch(&FaultTally::default(), at(9.5)), None);
+        assert_eq!(f.watch(&short, at(10.0)), None);
+        assert!(f.watch(&short, at(15.5)).is_some());
+        assert_eq!(short.binding(), "the limit of a frame");
     }
 }

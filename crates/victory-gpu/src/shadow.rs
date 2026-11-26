@@ -5362,6 +5362,39 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// Bytes of [`by_address`] copies given the card's own memory so far (never
+/// counted down: arenas live as long as the process).
+static BY_ADDRESS_CARD: AtomicU64 = AtomicU64::new(0);
+
+/// At most so much of [`by_address`]'s copies on the card's own memory
+/// (4 GiB unless `VICTORY_MEMORY_CARD_MB` says otherwise); past that the
+/// side shaders see is in the PC's memory.
+pub(crate) fn by_address_card_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(4096) << 20
+    })
+}
+
+/// Whether the card has room for `len` more bytes of [`by_address`]: its
+/// use stays under 97 % of its budget (or no budget is known).
+fn by_address_room(host: &crate::host::Host, len: u64) -> bool {
+    host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97)
+}
+
+/// Whether a [`by_address`] copy of `len` bytes made now would have its
+/// shaders' side on the card: card copies are on, the card has room, and
+/// the cap ([`by_address_card_most`]) is not reached.
+pub(crate) fn by_address_on_card(len: u64) -> bool {
+    host().is_some_and(|host| {
+        cards()
+            && host.card_ready()
+            && by_address_room(host, len)
+            && BY_ADDRESS_CARD.load(Ordering::Relaxed) + len <= by_address_card_most()
+    })
+}
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5375,18 +5408,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
-    let most = *MOST.get_or_init(|| {
-        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
-    });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let room = by_address_room(host, len);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+    let on_card = if room && BY_ADDRESS_CARD.fetch_add(len, Ordering::Relaxed) + len <= by_address_card_most() {
         host.uav_buffer(len)
     } else {
         None

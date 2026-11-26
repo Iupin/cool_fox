@@ -491,6 +491,59 @@ still go on the CPU.
   pre-populates what it can see (`memory.rs:29-43`). Only buffers of at most
   `BACK` bytes come back to the title; structures stay on the card. Arena card
   sides are capped by `VICTORY_MEMORY_CARD_MB` (4096).
+
+  **Arenas and pages.** An arena is 64 MiB (`ARENA`, 1,024 pages) made by
+  `Memory::another`: 64 MiB of our memory at a low address
+  (`upload::reserve`) that stands for the title's pages, plus a
+  `shadow::by_address` copy of it, which is a 64 MiB upload buffer (the CPU's
+  side) and a 64 MiB shader side, on the card while the card's use stays
+  under 97 % of its budget and the arena cap is not reached
+  (`by_address_on_card`), else a second buffer in the PC's memory. So a page
+  costs 64 KiB of card memory and 128 KiB of PC memory (192 KiB with no room
+  on the card). Arenas are never given back (the directory names them for
+  good); a page given back goes on the free list and is reused. All pages
+  held are at most `MOST` (49,152, 3 GiB). Pages held for a list's views and
+  constants, a packed structure or upload memory are kept for the run; pages
+  of a packed structure alone go back when the structure is gone.
+
+  **Pages for faults** (`FaultPages`, since 2026-11-26). Each frame's faults
+  are taken in turn (`take_faults`, the start rotating so pages left out go
+  first next frame):
+  - below 4 GiB or past the directory: **wild**, counted, nothing spent;
+  - already with a copy: counted;
+  - past `FAULTS` (128) made or `FAULT_TRIES` (1,024) tried this frame:
+    **capped**, tried again when shaders touch them again;
+  - not committed or not watched (`possible`): **not the title's**, counted
+    (a try spent);
+  - in a title buffer or a window: that copy, no arena page;
+  - else an arena page. When `fault_limits().most` pages are held for faults
+    (`VICTORY_MEMORY_FAULT_MB`, by default an eighth of
+    `VICTORY_MEMORY_CARD_MB`: 512 MiB, 8,192 pages), or a new place would need
+    another arena and the card has no room for one, the page made longest ago
+    is given back for it (`give_back_oldest`; none held fewer than
+    `FAULT_FRESH`, 8, frames). If none can go: **held limit** or **no room**,
+    tried again later. Free places are used beyond the `SPARE` (1,024) kept
+    for the builder.
+
+  Shaders do not report touches of pages that have a copy, so "made longest
+  ago" stands for "least recently touched": a page still in use that is given
+  back faults again and comes back a frame later. A page for faults that a
+  list names later is held for that and no longer counted. Until 2026-11-26
+  pages for faults were capped at 2,048 for the whole run (`FAULTS_ALL`),
+  used up about 45 frames after the world appeared; from then on 550 to
+  1,277 pages a frame were left without a copy for the rest of the session
+  (`docs/bug-journal.md`).
+
+  Log lines: at start `title memory by address: pages for faults: at most
+  128 made a frame (1024 title pages tried), 8192 held at a time (512 MiB),
+  ...`; per frame (the first 40, then every 100th) the WARN `shaders touched
+  pages that had no copy ...` with `made`, `there`, `wild`, `not_title`,
+  `capped`, `held_limit`, `no_room`, `failed`, `given_back`, `held`,
+  `from_faults`; every 10 s with the usual line an INFO `pages for faults
+  since the last line, over N frames: ... binding: ...`; and a WARN `for N s
+  every frame's shaders touched title pages that could not all be given a
+  copy ...` once a run of short frames has lasted 5 s (`STARVING`; again only
+  after a frame that was not short).
 - `upload.rs`: `allocate_upload` memory comes in 64 KiB blocks from arenas in
   [4 GiB, 2^37), because addresses must fit in 40 bits. Arenas live as long as
   the process: the directory keeps a copy at an address for good.
@@ -844,7 +897,8 @@ launcher sets, with the value it sets.
 | `VICTORY_WINDOWS_OWN` | shadow.rs:711 | off | Two sides for windows. |
 | `VICTORY_WINDOW_KB` | shadow.rs:5240 | 4096 grid | Window grid (1 MiB or 256 KiB experiments). |
 | `VICTORY_WINDOW_TAILS` | shadow.rs:5279 | off | Windows that run to the cell end. |
-| `VICTORY_MEMORY_CARD_MB` | shadow.rs:5384 | 4096 | VRAM cap for raw-address arena pages. |
+| `VICTORY_MEMORY_CARD_MB` | shadow.rs:5375 | 4096 | VRAM cap for raw-address arena pages (`by_address_card_most`). An arena goes on the card only below it and while the card's use stays under 97 % of the budget; otherwise its shader side is in PC memory. |
+| `VICTORY_MEMORY_FAULT_MB` | memory.rs:916 | an eighth of `VICTORY_MEMORY_CARD_MB` (512) | Raw-address pages made for faults held at a time, in MiB (at least 64, at most 3 GiB less the builder's spare). Past it the page made longest ago is given back for a new one (§3.8). |
 | `VICTORY_SNAPSHOT_POOL` | shadow.rs:1472 | 1024 | Snapshot buffers kept for reuse. |
 | `VICTORY_WIDE_BACK` | shadow.rs:1638 | on; **L**=1 | Snapshots and compares on `victory-wide-N`. |
 | `VICTORY_WIDE_SPIN` | shadow.rs:1657 | 0 µs | Spin before a wide worker sleeps. |
@@ -865,8 +919,8 @@ launcher sets, with the value it sets.
 | `VICTORY_INPLACE` / `_MB` | inplace.rs:89,97 | 0 / 4096 | 1 windows, 2 buffers too, opened in place. Do not use 2 with late wait. |
 | `VICTORY_INPLACE_PROBE` / `_MB` | inplace.rs:62,1236 | 0 / 64 | The driver probe and census. |
 | `VICTORY_UPLOAD_LOW` | upload.rs:42 | on | Upload memory below 2^37. |
-| `VICTORY_BVH_SIZES_WAIT`, `VICTORY_BVH_TRACE` | memory.rs:819,1091 | off | BVH diagnostics. |
-| `VICTORY_MEMORY_DUMP` | memory.rs:1197 | unset | A folder for raw-memory dumps. |
+| `VICTORY_BVH_SIZES_WAIT`, `VICTORY_BVH_TRACE` | memory.rs:1256,1528 | off | BVH diagnostics. |
+| `VICTORY_MEMORY_DUMP` | memory.rs:1634 | unset | A folder for raw-memory dumps. |
 
 ### Write detection
 
@@ -1009,6 +1063,12 @@ launcher sets, with the value it sets.
   is unknown (`pool.rs:91-98`).
 - Reads past a view on AMD into memory that was just freed (`host.rs:353-364`).
 - Tile mappings into heaps opened on title memory (`inplace.rs:31-32`).
+- Not a device-loss cause, but a hazard of the same kind: a raw-address
+  page given back (a packed structure gone, or since 2026-11-26 a page for
+  faults given back for a new one, `Memory::let_go`) has its directory entry
+  cleared and its arena place reused at once. Lists already sent still read
+  the place; it is memory of ours that stays mapped, so they read another
+  page's bytes, not freed memory. Arenas are never freed.
 - Device removal is checked in `relay_land` (`host.rs:4862`). `fail` adds DRED
   and address-book data when `VICTORY_D3D12_DRED` is set (`host.rs:5908`,
   `book.rs`). `tdr.rs` logs the TDR registry settings.
@@ -1072,7 +1132,7 @@ Do not run them while another build holds the target directory.
 | `host/torn.rs`, `host/place.rs` | 3 (1), 1 (1) | Torn fetches, copies in place. |
 | `tiles.rs` | 4 (1) | Levels on demand on WARP, or the card with `VICTORY_TILES_TEST_CARD=1`. |
 | `texture.rs`, `texture/ahead.rs` | 6 (3), 2 | Uncommitted tails read as zeros, digest, detiling. Cost benches are ignored. |
-| `resource.rs`, `inplace.rs`, `memory.rs`, `upload.rs`, `texback.rs`, `titlewrite*.rs`, `popwatch.rs` | 13, 7, 2, 2, 1, 5, 3 | Depth twin copies, in-place rules, the directory, arenas, kinds, x86 store decode. |
+| `resource.rs`, `inplace.rs`, `memory.rs`, `upload.rs`, `texback.rs`, `titlewrite*.rs`, `popwatch.rs` | 13, 7, 7, 2, 1, 5, 3 | Depth twin copies, in-place rules, the directory, arenas, pages for faults (on memory of the test's own: pages for the whole run past 2,048, the limits of a frame and of pages held, the oldest given back first, wild faults spend nothing, no room tried again, the 5 s warning), kinds, x86 store decode. |
 | `replay/*.rs` | about 25 | Wire round-trips (truncation refused), states, hooks, edits, `find`. |
 | `tests/replay.rs` | 1 | End-to-end record and replay, compared byte for byte. |
 | `tests/replay_big.rs` | 1 (ignored) | Frame-sized cost. |

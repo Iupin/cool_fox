@@ -103,12 +103,18 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
-| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096); a page goes on the card only while the card's use stays under 97 % of its budget, so a smaller card gets less (`shadow::by_address`) |
+| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096); an arena (64 MiB, 1,024 pages) goes on the card only while the card's use stays under 97 % of its budget, so a smaller card gets less, and one made without room has its shaders' side in the PC's memory (`shadow::by_address`); pages for faults make no arena without room on the card, they reuse their own oldest pages instead |
+| `VICTORY_MEMORY_FAULT_MB` | pages made for faults held at a time (an eighth of `VICTORY_MEMORY_CARD_MB`: 512 MiB, 8,192 pages); past it, or when the card has no room for another arena, the one made longest ago is given back for a new one; at most 128 are made a frame |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,
-dispatches, faults and what came.
+dispatches, faults and what came, and one "title memory by address: pages for
+faults since the last line ..." with what became of the faults (made, given
+back, left out by the limit of a frame, the limit held or room on the card,
+not the title's, wild) and which limit binds. A WARN "for N s every frame's
+shaders touched title pages that could not all be given a copy" says when that
+has lasted 5 s (`docs/crates/victory-gpu-memory.md` §3.8).
 
 ## Known gaps
 
@@ -136,7 +142,22 @@ dispatches, faults and what came.
   to give a table of addresses by slot). The title did not create them in any
   run so far.
 - An access to a page that is not there is lost (a read gives zero, a store is
-  dropped).
+  dropped). The page gets a copy a frame later if it is the title's memory and
+  within the limits. Until 2026-11-26 pages made for faults were capped at
+  2,048 for the whole run: in four launches with ray tracing on (logs checked)
+  they were used up some 45 frames after the world appeared, and from then on
+  every frame 550 to 1,277 pages shaders touched had no copy (`made=0`), so the
+  ray-traced passes read zeros wherever the title's structures moved after the
+  first second. Now at most 128 are made a frame and 8,192 held, the one made
+  longest ago given back for a new one. Not confirmed on screen: whether this
+  was behind the blocky 8x8-tile shadow edges, the runaway bright hotspot and
+  the wrong glass reflections. Known limits of the new rule: shaders do not
+  report touches of pages that have a copy, so "made longest ago" stands for
+  "least recently touched" and a page still in use can be given back (it
+  faults and comes back a frame later); if more than 128 new pages a frame are
+  needed for long, the WARN above says so. Many faults name addresses below
+  4 GiB (pointers read as zero from a page that had no copy); they are counted
+  as wild and cost nothing.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.

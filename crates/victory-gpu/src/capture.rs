@@ -379,6 +379,10 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    // The first target in dump order with non-finite or huge texels, and
+    // how many have some.
+    let mut first: Option<(usize, usize, u32, u64, u32, Odd)> = None;
+    let (mut odd, mut counted) = (0, 0);
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -396,10 +400,171 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        let Some(found) = dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d) else {
+            continue;
+        };
+        counted += 1;
+        if found.any() {
+            odd += 1;
+            first.get_or_insert((i, *resource, d.Format.0 as u32, d.Width, d.Height, found));
+        }
+    }
+    match first {
+        Some((i, resource, format, width, height, found)) => tracing::warn!(
+            frame,
+            i,
+            resource = format_args!("{resource:#x}"),
+            format,
+            width,
+            height,
+            nan = found.nan,
+            inf = found.inf,
+            neg_inf = found.neg_inf,
+            huge = found.huge,
+            not_finite_box = ?found.not_finite_box,
+            huge_box = ?found.huge_box,
+            odd,
+            counted,
+            "dumped targets: the first in dump order with non-finite or huge texels (`odd` of the `counted` float targets have some)"
+        ),
+        None if !targets.is_empty() => {
+            tracing::info!(frame, counted, "dumped targets: no float target has non-finite or huge texels")
+        }
+        None => {}
     }
 }
 
+/// Of a float target: texels with a channel that is NaN, +Inf, -Inf, or
+/// huge (finite and of magnitude at least [`HUGE`], or at the largest value
+/// of a 16-bit or 11/10-bit float, where a runaway value stops), and the
+/// boxes (x0, y0, x1, y1, inclusive) of those that are not finite and of
+/// those that are huge. A texel counts once per kind.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Odd {
+    nan: u64,
+    inf: u64,
+    neg_inf: u64,
+    huge: u64,
+    not_finite_box: Option<[u32; 4]>,
+    huge_box: Option<[u32; 4]>,
+}
+
+impl Odd {
+    fn any(&self) -> bool {
+        self.nan + self.inf + self.neg_inf + self.huge > 0
+    }
+}
+
+/// A 32-bit float channel at least this big is huge.
+const HUGE: f32 = 1e6;
+
+/// What a channel is.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Plain,
+    Nan,
+    Inf,
+    NegInf,
+    Huge,
+}
+
+fn kind_f32(v: f32) -> Kind {
+    if v.is_nan() {
+        Kind::Nan
+    } else if v == f32::INFINITY {
+        Kind::Inf
+    } else if v == f32::NEG_INFINITY {
+        Kind::NegInf
+    } else if v.abs() >= HUGE {
+        Kind::Huge
+    } else {
+        Kind::Plain
+    }
+}
+
+/// A half float's bits: exponent all ones is Inf (mantissa 0) or NaN; the
+/// largest finite value (65504) counts as huge.
+fn kind_half(h: u16) -> Kind {
+    match (h >> 10 & 0x1f, h & 0x3ff, h >> 15) {
+        (31, 0, 0) => Kind::Inf,
+        (31, 0, _) => Kind::NegInf,
+        (31, _, _) => Kind::Nan,
+        (30, 0x3ff, _) => Kind::Huge,
+        _ => Kind::Plain,
+    }
+}
+
+/// An unsigned float of R11G11B10 with `man` mantissa bits and a 5-bit
+/// exponent: as [`kind_half`] (no sign).
+fn kind_small(bits: u32, man: u32) -> Kind {
+    let (exp, m) = (bits >> man & 0x1f, bits & ((1 << man) - 1));
+    match (exp, m) {
+        (31, 0) => Kind::Inf,
+        (31, _) => Kind::Nan,
+        (30, m) if m == (1 << man) - 1 => Kind::Huge,
+        _ => Kind::Plain,
+    }
+}
+
+/// [`Odd`] of rows of a float format (`pitch` bytes apart): R32G32B32A32,
+/// R32G32, R32 and D32 floats, R16G16B16A16, R16G16 and R16 floats,
+/// R11G11B10; all channels, alpha too. None for other formats (typeless
+/// ones too: they may hold integers).
+fn odd_texels(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Odd> {
+    let (n, channels): (usize, usize) = match format {
+        2 => (16, 4),
+        16 => (8, 2),
+        40 | 41 => (4, 1),
+        10 => (8, 4),
+        34 => (4, 2),
+        54 => (2, 1),
+        26 => (4, 3),
+        _ => return None,
+    };
+    let kind = |b: &[u8], c: usize| -> Kind {
+        match format {
+            2 | 16 | 40 | 41 => kind_f32(f32::from_le_bytes(b[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]))),
+            26 => {
+                let v = u32::from_le_bytes(b[..4].try_into().unwrap_or([0; 4]));
+                match c {
+                    0 => kind_small(v & 0x7ff, 6),
+                    1 => kind_small(v >> 11 & 0x7ff, 6),
+                    _ => kind_small(v >> 22, 5),
+                }
+            }
+            _ => kind_half(u16::from_le_bytes([b[2 * c], b[2 * c + 1]])),
+        }
+    };
+    let grow = |b: &mut Option<[u32; 4]>, x: u32, y: u32| {
+        let r = b.get_or_insert([x, y, x, y]);
+        *r = [r[0].min(x), r[1].min(y), r[2].max(x), r[3].max(y)];
+    };
+    let mut odd = Odd::default();
+    for y in 0..h {
+        for x in 0..w {
+            let Some(b) = rows.get(y * pitch + x * n..y * pitch + (x + 1) * n) else {
+                continue;
+            };
+            let kinds: [Kind; 4] = std::array::from_fn(|c| if c < channels { kind(b, c) } else { Kind::Plain });
+            let has = |k: Kind| kinds.contains(&k);
+            let (nan, inf, neg_inf, huge) = (has(Kind::Nan), has(Kind::Inf), has(Kind::NegInf), has(Kind::Huge));
+            odd.nan += u64::from(nan);
+            odd.inf += u64::from(inf);
+            odd.neg_inf += u64::from(neg_inf);
+            odd.huge += u64::from(huge);
+            if nan || inf || neg_inf {
+                grow(&mut odd.not_finite_box, x as u32, y as u32);
+            }
+            if huge {
+                grow(&mut odd.huge_box, x as u32, y as u32);
+            }
+        }
+    }
+    Some(odd)
+}
+
+/// Saves one target; for a float one, its non-finite and huge texels
+/// ([`odd_texels`], said when there are any).
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -408,8 +573,8 @@ fn dump_one(
     i: usize,
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
-) {
-    let Ok(list) = host.new_list() else { return };
+) -> Option<Odd> {
+    let Ok(list) = host.new_list() else { return None };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -440,13 +605,13 @@ fn dump_one(
     if let Some((buffer, footprint)) = stencil {
         stencil_values(&buffer, &footprint, frame, resource);
     }
-    let Some((buffer, footprint)) = read else { return };
+    let (buffer, footprint) = read?;
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
+            return None;
         }
         let pitch = f.RowPitch as usize;
         // A volume's slices follow each other, a row pitch times the height
@@ -456,7 +621,28 @@ fn dump_one(
         if depth > 1 {
             save_volume(frame, i, resource, d.Format.0 as u32, &f, rows);
             buffer.Unmap(0, None);
-            return;
+            return None;
+        }
+        // Values that cannot be shown: NaN and Inf are left out of the low
+        // and high of "target values", so a target full of them looks
+        // normal there (a runaway value in a temporal feedback loop).
+        let odd = odd_texels(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
+        if let Some(o) = odd.filter(Odd::any) {
+            tracing::warn!(
+                frame,
+                i,
+                ?resource,
+                format = f.Format.0,
+                width = f.Width,
+                height = f.Height,
+                nan = o.nan,
+                inf = o.inf,
+                neg_inf = o.neg_inf,
+                huge = o.huge,
+                not_finite_box = ?o.not_finite_box,
+                huge_box = ?o.huge_box,
+                "target values: texels with a NaN, +Inf or -Inf channel, or a huge one, and their boxes (x0, y0, x1, y1)"
+            );
         }
         // One-dimensional tables (tone curves) of 32-bit floats: as numbers.
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && f.Format == DXGI_FORMAT_R32_FLOAT {
@@ -506,6 +692,7 @@ fn dump_one(
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
         buffer.Unmap(0, None);
+        odd
     }
 }
 
@@ -1054,6 +1241,47 @@ mod tests {
         assert_eq!(same, [1, 0, 3]);
         assert_eq!(super::texel_size(10), Some(8));
         assert_eq!(super::texel_size(98), None);
+    }
+
+    /// A 4x3 R16G16B16A16_FLOAT target, rows 40 bytes apart (8 of padding
+    /// full of NaN bits, not read): NaN, +Inf, -Inf and the largest half are
+    /// counted per texel with their boxes; alpha counts too.
+    #[test]
+    fn non_finite_and_huge_texels_are_counted_with_their_boxes() {
+        let (one, nan, inf, neg_inf, top) = (0x3c00u16, 0x7e00u16, 0x7c00u16, 0xfc00u16, 0x7bffu16);
+        let mut texels = [[one; 4]; 12];
+        texels[4 + 1][0] = nan; // (1, 1)
+        texels[2][3] = nan; // (2, 0), alpha
+        texels[8 + 3] = [inf, neg_inf, one, one]; // (3, 2)
+        texels[8][1] = top; // (0, 2)
+        let mut rows = Vec::new();
+        for row in texels.chunks(4) {
+            for t in row {
+                rows.extend(t.iter().flat_map(|c| c.to_le_bytes()));
+            }
+            rows.extend([0xff; 8]);
+        }
+        let odd = super::odd_texels(10, 4, 3, 40, &rows).unwrap();
+        assert_eq!((odd.nan, odd.inf, odd.neg_inf, odd.huge), (2, 1, 1, 1));
+        assert_eq!(odd.not_finite_box, Some([1, 0, 3, 2]));
+        assert_eq!(odd.huge_box, Some([0, 2, 0, 2]));
+        assert!(odd.any());
+        // R32_FLOAT: above 1e6 is huge, a finite million less one is not.
+        let words: Vec<u8> = [1.0f32, 2e6, -3e7, 999_999.0, f32::NAN, f32::NEG_INFINITY]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let odd = super::odd_texels(41, 3, 2, 12, &words).unwrap();
+        assert_eq!((odd.nan, odd.inf, odd.neg_inf, odd.huge), (1, 0, 1, 2));
+        assert_eq!(odd.huge_box, Some([1, 0, 2, 0]));
+        assert_eq!(odd.not_finite_box, Some([1, 1, 2, 1]));
+        // R11G11B10: blue (10 bits) all ones in the exponent, no mantissa.
+        let packed = (0x3c0u32 | 0x3c0 << 11 | 0x1f << 27).to_le_bytes();
+        assert_eq!(super::odd_texels(26, 1, 1, 4, &packed).map(|o| o.inf), Some(1));
+        // Finite values only, and formats it does not decode.
+        assert!(!super::odd_texels(10, 1, 1, 8, &[0, 0x3c, 0, 0x3c, 0, 0x3c, 0, 0x3c]).unwrap().any());
+        assert_eq!(super::odd_texels(28, 1, 1, 4, &[0; 4]), None);
+        assert_eq!(super::odd_texels(9, 1, 1, 8, &[0; 8]), None);
     }
 
     /// A staircase of 4 steps over 17 entries: few values, many equal

@@ -147,13 +147,13 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `tdr.rs` | 129 | C | Logs Windows TDR registry settings |
 | `switch.rs` | 63 | C | `switch::on` (set and not `0`) and the `toggled!` macro |
 | `ab.rs` | 118 | D | `VICTORY_AB` switches that flip while running |
-| `capture.rs` | 1071 | D | `VICTORY_CAPTURE` PNGs, op listings, target dumps (3D textures as slice strips, 1D float tables as numbers) |
+| `capture.rs` | 1299 | D | `VICTORY_CAPTURE` PNGs, op listings, target dumps (3D textures as slice strips, 1D float tables as numbers; float targets' NaN, +Inf, -Inf and huge texels counted with their boxes, and the first target in dump order that has any) |
 | `copystat.rs` | 1348 | D | Copy/phase statistics, `VICTORY_COPY_MODE`, `VICTORY_MEMORY_MAP` |
 | `popwatch.rs` | 422 | D | `VICTORY_POP_WATCH` |
 | `faultbook.rs` | 105 | D | `VICTORY_FAULT_BOOK` |
 | `book.rs` | 699 | D | Who owns which card memory (`VICTORY_BOOK`) |
 | `timeline.rs` + `timeline/{hooks,record,report}.rs` | 51+304+621+914 | C/D | `span()` (no-op without diagnostics), Chrome trace (`VICTORY_TIMELINE`) |
-| `shadow.rs` | 5307 | M | Host copies of title buffers |
+| `shadow.rs` | 5981 | M | Host copies of title buffers |
 | `watch.rs` | 4604 | M | Write watching / guards |
 | `writers.rs` | 2215 | M | The writers watch: which code writes a range of title memory, and what (`VICTORY_WRITERS*`, read in diagnostics builds; [memory doc §3.4a](victory-gpu-memory.md)) |
 | `resource.rs` | 4390 | M | Heaps, resources, host textures (`HostTexture`, `host_transition`) |
@@ -163,7 +163,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `upload.rs` | 162 | M | `allocate_upload` memory below 2^40 |
 | `pool.rs` | 690 | M | GPU memory pools |
 | `residency.rs` | 177 | M | Residency budgets |
-| `memory.rs` | 1244 | M | Title memory by raw address for shaders |
+| `memory.rs` | 1952 | M | Title memory by raw address for shaders (arenas, the directory, pages for faults with their limits: `FaultPages`) |
 | `picked.rs` | 360 | M | `VICTORY_PICKED_WRITES` |
 | `inplace.rs` | 1387 | M | Title memory opened as host heaps |
 | `safecopy.rs` | 699 | M | Fault-tolerant copies |
