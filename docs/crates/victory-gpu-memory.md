@@ -421,6 +421,16 @@ Per submission (`Host::card_before`, `host.rs:4247`; `card_back`, `host.rs:4994`
    into title memory and the CPU side (Shadow::card_merge / card_merge_relay)
 ```
 
+What changed on the CPU sides is taken by `shadow::card_dirty`. Since
+2026-11-27 (`VICTORY_CARD_TOUCHED`, on) it takes only the copies in
+`TOUCHED`, a list a copy is put into when its `touched` flag goes from unset
+to set; before, every submission looked at all ~3,700 card copies (3.8 % of
+the submitting thread in a gameplay profile). The rule it rests on is the
+old one: what puts ranges into `dirty` sets `touched` under `dirty`'s lock,
+and what takes `dirty` clears `touched` under it, so a change after a take
+puts the copy into the list again and one before is in what the take took.
+A copy changed before it was registered is put in by `carded`.
+
 Writes outside declared ranges are not found. Later shaders see them, and they
 reach the title only when a declared range later covers their piece
 (`shadow.rs:163-166`). `picked.rs` covers views picked by index.
@@ -876,6 +886,7 @@ launcher sets, with the value it sets.
 | `VICTORY_CARD_ALL` | shadow.rs:511 | off | Every buffer gets two sides (small ones in PC memory). |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | shadow.rs:415 | on | Reserve VRAM for card copies. The doc at shadow.rs:386 says "off", which is stale; the code and shadow.rs:404 say on. |
 | `VICTORY_CARD_HASH_LEN` | shadow.rs:4437 | on | Hash only the title buffer's own bytes, not the 64 KiB-rounded buffer. |
+| `VICTORY_CARD_TOUCHED` | shadow.rs `touched_list` | on | Submissions take only the card copies whose CPU side changed (§3.5); `0`: look at all of them, as before 2026-11-27. `VICTORY_AB`-switchable. |
 | `VICTORY_CARD_WINDOWS_MB` | shadow.rs:635 | 0 | Cap on windows with a VRAM side. |
 | `VICTORY_WINDOWS_BAR_MB` | shadow.rs:673 | 0 | Cap on windows in `GPU_UPLOAD` (BAR) heaps. |
 | `VICTORY_WINDOWS_OWN` | shadow.rs:711 | off | Two sides for windows. |
@@ -1102,7 +1113,7 @@ Do not run them while another build holds the target directory.
 | `watched.rs` | 3 | A write-watched block is zeroed and aligned, the kernel answers for its whole 64 KiB pages (uncommitted ones too), the journal tells its writes to every asker, a `ReadFile` into it is seen. |
 | `watch.rs` | 42 | Refusals remembered until the address space changes, and view memory refused before missing no write (through the other view, twice, and a kernel read). The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
 | `writers.rs` | 12 | The writers watch on memory of the test's own: a write is told with its instruction, offset, size, value and count and is done; a write beside the range is counted only; a string store across two pages; a write through another view; a kernel read (`ReadFile`) refused while watched and landing under `kernel_writing`, told as the kernel's; the guards still report their block written; detail stops while counting goes on; the window arms and disarms; a range mapped after the window opened is watched then; a binding found by a draw is watched; switch parsing. |
-| `shadow.rs` | 33 (1) | Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
+| `shadow.rs` | 34 (1) | The touched list takes a changed card copy once (changed before and after registering, many times). Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |
 | `safecopy.rs` | 8 (1) | Every length and alignment. Only changed dwords are put. Faults become failures. |
 | `pool.rs` | 7 | Ranges, spares, growth back-off, rest, ripe blocks, reclaim. |

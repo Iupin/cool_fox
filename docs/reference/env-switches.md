@@ -497,7 +497,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_TRANSLATOR` | `crates/victory-gpu/src/shader_cache.rs:57` | build-time (`cargo:rustc-env`, victory-gpu/build.rs:44) | BLAKE3 of victory-shader sources, `shader_cache.rs`, `Cargo.lock`, `rust-toolchain.toml`: part of every shader-cache key. | neither |
 
-### victory-gpu / shadow (24)
+### victory-gpu / shadow (25)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -507,6 +507,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_CARD_BUFFERS_MIN_KB` | `crates/victory-gpu/src/shadow.rs:300` | u64; unset | `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the least size in KiB, so that it can go under 1 MiB: 64 is every title buffer. Under the default cap of a ≤ 12 GiB budget, copies under the tier's least size (16 MiB) share at most 3/4 of the cap. | cmd=`64` |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | `crates/victory-gpu/src/shadow.rs:291` | MiB; default derived (`resolve_card_limits`): 16 at ≤ 12 GiB, 4 below 20 GiB, 1 above | Least size of a title buffer that gets a card-memory copy (see also `_MIN_KB`). | neither |
 | `VICTORY_CARD_HASH_LEN` | `crates/victory-gpu/src/shadow.rs:4437` | true unless `0` | `VICTORY_CARD_HASH_LEN=0`: the whole buffer. | neither |
+| `VICTORY_CARD_TOUCHED` | `crates/victory-gpu/src/shadow.rs` `touched_list` | default ON; `0` off; `VICTORY_AB`-switchable | Of the copies in the card's memory, the ones whose CPU side changed since `card_dirty` last took them are kept in a list (`VICTORY_CARD_TOUCHED=0`: every submission looks at all of them, as before 2026-11-27). | neither |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | `crates/victory-gpu/src/shadow.rs:415` | true unless `0` (default ON; the comment above still says off by default: stale) | Whether the texture queue leaves room on the card for card copies of title buffers not made yet. | neither |
 | `VICTORY_CARD_WINDOWS_MB` | `crates/victory-gpu/src/shadow.rs:635` | u64; default `0` | The most bytes of windows outside buffers whose copies go to the card's memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none). | neither |
 | `VICTORY_EXACT_BACK` | `crates/victory-gpu/src/shadow.rs:2267` | true unless `0` | Whether what shaders wrote goes into title memory run by run ([`put_changed`]; on by default, `VICTORY_EXACT_BACK=0` writes the whole stretch from the first changed byte to the last, as before). | neither |
