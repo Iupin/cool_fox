@@ -7622,6 +7622,15 @@ fn split_line(frames: f64) {
         r[11],
         r[12] / 1e6,
     );
+    let lone: Vec<f64> = crate::watch::lone_asks().iter().map(|&n| n as f64 / frames).collect();
+    tracing::info!(
+        "ranges a submission's one asking asked alone per frame: {:.0}, in {:.0} reservations ({:.0} of less than 64 MiB, {:.0} \
+         holding two or more of them)",
+        lone[0],
+        lone[1],
+        lone[2],
+        lone[3],
+    );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
          first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
