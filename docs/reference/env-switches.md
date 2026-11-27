@@ -249,7 +249,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_VIEW_EXTENT` | `crates/victory-gpu/src/descriptor/host.rs:3603` | true unless `0` | `VICTORY_VIEW_EXTENT=0` looks the copy up by the view's range alone, as before. | neither |
 | `VICTORY_VIEW_INLINE` | `crates/victory-gpu/src/descriptor.rs:897` | true unless `0` | `VICTORY_VIEW_INLINE=0` makes every view a table entry, as before. | neither |
 
-### victory-gpu / draw (25)
+### victory-gpu / draw (26)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -274,6 +274,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_SCISSOR_TEST` | `crates/victory-gpu/src/draw.rs:524` | only `full` | An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`): they are all widened to the whole target. | neither |
 | `VICTORY_TEXTURE_CATCHUP` | `crates/victory-gpu/src/draw.rs:2635` | true unless `0` | `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. | neither |
 | `VICTORY_TEXTURE_STAGE_MB` | `crates/victory-gpu/src/draw.rs:2522` | u64 | `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of textures (a scene's first minutes) then drains in fewer frames. | neither |
+| `VICTORY_RELOOK_MS` | `crates/victory-gpu/src/draw.rs` (heap texture pass) | ms; default `4000` | How long a slot of a texture picked by index with nothing to upload waits at most for its next look, in frames (between 16 and the larger of 256 and the value / 16). Longer means fewer looks and a texture the title changes with nothing to tell of it seen later. After rorodev6/victory-nvidia-megafork 77e13a9 (trustno1-coder), where it is 20,000. | neither |
 | `VICTORY_TEXTURE_STAGE_MS` | `crates/victory-gpu/src/draw.rs:2629` | number; default `250` | Also within a time per pass: the pass runs on a thread that records the frame, and making and staging 192 MB of textures took 1.6-2.2 s of each of the world's first twenty frames (run 20). | neither |
 | `VICTORY_THREAD_DIMENSIONS` | `crates/victory-gpu/src/draw.rs:4404` | true unless `0` | `VICTORY_THREAD_DIMENSIONS=0`: such counts are taken for groups, as before. | neither |
 | `VICTORY_UNWATCHED_FRAMES` | `crates/victory-gpu/src/draw.rs:996` | number; default `1` | Memory that is not write-watched is copied whole by every refresh. | neither |
