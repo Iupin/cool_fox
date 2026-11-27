@@ -466,7 +466,30 @@ added in `8cc31ab` ("archived kernels … validated wave32 PSOs on RTX").
   writes FMax/FMin, legacy mul, med3 and fract as single host ops (`emit/mod.rs:226-263`).
 - `group_sync()` exists because NVIDIA's barrier waits for every thread and hangs the
   card when some never arrive (`emit/mod.rs:160-185`).
-- `VICTORY_F16_NEAREST`: NVIDIA's `f32tof16` rounds toward zero (`lower.rs:1096-1109`).
+- **16-bit float rounding** (`VICTORY_F16_NEAREST=1`; off by default): the host's `f32tof16`
+  rounds toward zero on NVIDIA and on WARP; the console rounds 16-bit results as
+  `MODE.FP_ROUND[3:2]` says, to nearest even unless a program sets toward zero.
+  `f16_round_toward_zero` (`lower.rs`) follows `s_setreg_imm32_b32
+  hwreg(HW_REG_MODE, ...)` writes of those bits through the blocks (start: to
+  nearest; a register value, the directed modes and joins that disagree: to
+  nearest), and `Lower::console_half` rounds every 16-bit result (VOP1/2/3
+  `_f16`, `v_cvt_f16_f32`, packed `v_pk_*_f16`, `v_fma_mixlo/hi_f16`): the f32
+  is rounded in place to the 10 fraction bits a normal half keeps (bias and
+  mask on its bits, about a dozen integer operations, a NaN kept, past 65504
+  infinity) so the host's one conversion has nothing left to round
+  (*shortcut*: subnormal halves keep the host's rounding of their last place).
+  The exact `f16_nearest` (four conversions a result) made the title's frames
+  four times as long on the card when used for every result; it stays for the
+  16-bit wave sums. `v_cvt_pkrtz_f16_f32` is always toward zero. 6,301 of the title's ~25,700 programs bracket packing code
+  with `hwreg(HW_REG_MODE, 2, 2)` writes of 3 and 0 (9,417 writes). Before
+  2026-11-27 every result went through the host's conversion (toward zero):
+  the title's upscaler (AMD FSR, `amd_fidelityfx_upscaler_xbox.dll`) computes
+  its network's inputs in 16 bits and its history ran away on the hair (the
+  hotspot). With the switch no launch showed the hotspot (4 of 4: twice
+  everything to nearest, twice as `MODE` says), but 3 of the 4 were posterised
+  for the whole session, which none of about 12 launches without it (ray
+  tracing on) was; so it is off by default until that is understood
+  (`docs/bug-journal.md`, 2026-11-27).
 
 ### Mesh shaders
 
@@ -488,6 +511,19 @@ added in `8cc31ab` ("archived kernels … validated wave32 PSOs on RTX").
   (`helper_own`, `VICTORY_HELPER_OWN`).
 - The first-half interpolation retry (above).
 - Comparison samplers set filter bit 0x80 (`emit/mod.rs:877-888`).
+- **Early depth.** A pixel program whose `DB_SHADER_CONTROL` (native stage
+  data `E+0x138`) has `DEPTH_BEFORE_SHADER` (bit 12, the console compiler's
+  `[earlydepthstencil]`) declares `ForceEarlyDepthStencil` (DXIL shader flag
+  bit 3, `flags::EARLY_DEPTH`; `emit::early_depth`, set in `Lower::new`),
+  unless it writes depth, stencil or coverage. Without it the host tests
+  depth after a program that writes unordered views, runs it for pixels
+  the console never runs, and keeps its stores (and a killed pixel writes no
+  depth where the console's did). In the title 3,009 of 12,056 pixel
+  programs have the bit (`5200`/`0x1450` for the glass pre-pass
+  `PS_AlphaPrepass`). Until 2026-11-26 the register was read and not used:
+  the glass pre-pass stored the window's depth and motion over the hair in
+  front of it, and the upscaler's history ran away there (the hotspot,
+  `docs/bug-journal.md`). `VICTORY_EARLY_DEPTH=0` turns it off (key).
 
 ### Rectangle lists
 
@@ -575,6 +611,7 @@ part of the runtime cache key (§6).
 | `VICTORY_HELPER_OWN` | `0` off (on) | pixel helper lanes read their own value at first-lane reads | `emit/mod.rs:157`; key |
 | `VICTORY_BVH_FENCES` | `0` off (on) | fences around BVH builder atomics | `emit/mod.rs:192`; key |
 | `VICTORY_BVH_BOUNDS` | `0` off (on) | bound builder accesses near root views; implausible header sizes count as none | `emit/mod.rs:201`; key |
+| `VICTORY_EARLY_DEPTH` | `0` off (on) | pixel programs the console tests before they run declare `[earlydepthstencil]` | `emit/mod.rs` `early_depth_on`; key |
 | `VICTORY_RDNA_FLOAT` | bitset of `rdna::{MAX_MIN 1, LEGACY 2, MED3 4, FRACT 8}` (15) | single host ops for those console float ops, on RDNA hosts only | `emit/mod.rs:243`; key via `host_settings` |
 | `VICTORY_WAVE_LOCAL` | `0` off, `idiom` strict (on) | local-wave retries; `idiom` refuses approximate forms | `emit/mod.rs:470,476`; key |
 | `VICTORY_WAVE_WIDE` | `1` on, `0` off (unset: off, except 2 digests and the driver-loop case) | `widen` retries. `0` also disables the `LANE_MASK` widen | `emit/mod.rs:542,649`; key |
@@ -582,7 +619,7 @@ part of the runtime cache key (§6).
 | `VICTORY_WAVE_OWN_BITS` | `0` off (on) | `own_bits` proof for wave ORs in split wave64 | `lower.rs:1121`; key |
 | `VICTORY_FIRST_HALF` | `0` off (on) | during the FIRST_HALF retry, evaluate first halves as pairs | `lower.rs:1673`; key |
 | `VICTORY_FIRSTLANE_OWN` | `1` on (off) | *approximate*: first-lane read where not every lane runs takes the host wave's own first lane | `lower.rs:8841`; key |
-| `VICTORY_F16_NEAREST` | `1` on (off) | round-to-nearest for f16 results (exact but untried in game) | `lower.rs:1108`; key |
+| `VICTORY_F16_NEAREST` | `1` on (off) | 16-bit float results rounded as the console's `MODE` says (to nearest, or toward zero where a program sets it), not by the host's conversion (toward zero); cures the upscaler hotspot, posterised 3 of 4 launches | `lower.rs` `f16_nearest_on`; key |
 | `VICTORY_STRICT_JOINS` | set (off) | refuse joins fed by values with no DXIL form instead of silently zero (40 programs stop with it) | `lower.rs:12622`; key |
 | `VICTORY_MESH_OUTPUT_STRICT` | set (off) | refuse mesh shaders over 32 KiB of outputs even at lane-count maxima | `lower.rs:4630`; key |
 | `VICTORY_WAVE_WHY` | set (off) | stderr `WAVE64-WHY`/`-RETRY`/`-FORM`/`-WIDE` diagnostics. Read uncached each time | `lower.rs:1502,1706`; `emit/mod.rs:458,651` |

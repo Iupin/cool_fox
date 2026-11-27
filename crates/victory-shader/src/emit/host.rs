@@ -334,6 +334,29 @@ impl Host {
         gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_tested(root, vs, gs, ps, false)
+    }
+
+    /// As [`Host::pipeline_with`], tested against a D32 depth target
+    /// (less, written) as [`Draw::depth`] gives one.
+    #[cfg(test)]
+    pub fn pipeline_depth_tested(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_tested(root, vs, None, ps, true)
+    }
+
+    fn pipeline_tested(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
+        ps: &[u8],
+        depth_tested: bool,
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -404,6 +427,12 @@ impl Host {
         if outputs.iter().any(|o| o.kind == 20) {
             desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
             desc.DepthStencilState.StencilEnable = true.into();
+        }
+        if depth_tested {
+            desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+            desc.DepthStencilState.DepthEnable = true.into();
+            desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         }
         // SAFETY: the description points at live data.
         let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
@@ -646,6 +675,16 @@ pub struct Draw<'a> {
     pub size: (u32, u32),
     /// Mesh thread groups to dispatch instead of drawing (0: draw).
     pub mesh_groups: u32,
+    /// A D32 depth target, for pipelines from [`Host::pipeline_depth_tested`].
+    pub depth: Option<Depth<'a>>,
+}
+
+/// [`Draw::depth`]: the depth target's value before the draw, and a pipeline
+/// that draws the same triangle first.
+#[cfg(test)]
+pub struct Depth<'a> {
+    pub clear: f32,
+    pub first: &'a ID3D12PipelineState,
 }
 
 #[cfg(test)]
@@ -870,7 +909,44 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
-            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            // The depth target, cleared; its heap and texture live to the end.
+            let mut depth_target = None;
+            if let Some(depth) = &d.depth {
+                let texture = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &D3D12_RESOURCE_DESC {
+                        Format: DXGI_FORMAT_D32_FLOAT,
+                        ..tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                    },
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    Some(&D3D12_CLEAR_VALUE {
+                        Format: DXGI_FORMAT_D32_FLOAT,
+                        Anonymous: D3D12_CLEAR_VALUE_0 {
+                            DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+                                Depth: depth.clear,
+                                Stencil: 0,
+                            },
+                        },
+                    }),
+                )?;
+                let heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .map_err(err)?;
+                let dsv = heap.GetCPUDescriptorHandleForHeapStart();
+                dev.CreateDepthStencilView(&texture, None, dsv);
+                list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, depth.clear, 0, None);
+                depth_target = Some((dsv, heap, texture));
+            }
+            list.OMSetRenderTargets(
+                1,
+                Some(&rtv),
+                false,
+                depth_target.as_ref().map(|t| &raw const t.0),
+            );
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -897,6 +973,11 @@ impl Host {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
+                if let Some(depth) = &d.depth {
+                    list.SetPipelineState(depth.first);
+                    list.DrawInstanced(3, 1, 0, 0);
+                    list.SetPipelineState(pso);
+                }
                 list.DrawInstanced(3, 1, 0, 0);
             }
             list.ResourceBarrier(&[transition(
@@ -963,6 +1044,7 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
+            drop(depth_target);
             Ok(out)
         }
     }

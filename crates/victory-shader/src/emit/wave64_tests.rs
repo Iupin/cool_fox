@@ -504,6 +504,93 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
     }
 }
 
+/// As [`a_16_bit_sum_rounds_to_nearest_when_asked_to`], for the packed form (`v_pk_add_f16`,
+/// both halves) and the mixed-precision one (`v_fma_mixlo_f16`, 1 x 0x3c03 + 2): the
+/// title's upscaler computes its network's inputs with both, and rounded toward zero they
+/// drift from the console's (the hotspot, `docs/bug-journal.md` 2026-11-27).
+#[test]
+fn packed_and_mixed_16_bit_results_round_to_nearest_when_asked_to() {
+    // v_pk_add_f16 v0, v7, v6 (op_sel_hi all set: unmodified halves)
+    let packed = [
+        0x7E0E_02FF,
+        0x3C03_3C03, // v_mov_b32 v7, 0x3c033c03
+        0x7E0C_02FF,
+        0x4000_4000, // v_mov_b32 v6, 0x40004000
+        0xCC0F_4000,
+        3 << 27 | 262 << 9 | 263, // v_pk_add_f16 v0, v7, v6
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    // v_fma_mixlo_f16 v0, v7, v5, v6: every source an f16 low half (op_sel_hi set),
+    // the f16 result into v0's low half (zero above it).
+    let mixed = [
+        0x7E0E_02FF,
+        0x0000_3C03, // v_mov_b32 v7, 0x3c03
+        0x7E0A_02FF,
+        0x0000_3C00, // v_mov_b32 v5, 0x3c00 (1.0)
+        0x7E0C_02FF,
+        0x0000_4000, // v_mov_b32 v6, 0x4000
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0xCC21_4000,
+        3 << 27 | 262 << 18 | 261 << 9 | 263, // v_fma_mixlo_f16 v0, v7, v5, v6
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, words, nearest_value) in [
+        ("packed", &packed[..], 0x4202_4202u32),
+        ("mixed", &mixed[..], 0x4202),
+    ] {
+        let native = native(words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        for nearest in [false, true] {
+            let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
+            let shader = lowered(&native, &p, &HashSet::new());
+            lower::TEST_F16_NEAREST.set(was);
+            let shader = shader.expect("lower");
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            for warp in [false, true] {
+                let Ok(host) = Host::new(warp) else { continue };
+                let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                    continue;
+                };
+                let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(1)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let got = out[0][0];
+                eprintln!("{label} 0x3c03 + 0x4000, warp {warp}, nearest {nearest}: {got:#x}");
+                if nearest {
+                    assert_eq!(got, nearest_value, "{label} warp {warp}");
+                } else {
+                    // the host's own rounding: to nearest, or one step toward zero
+                    let toward_zero = if label == "packed" { 0x0001_0001 } else { 1 };
+                    assert!(
+                        got == nearest_value || got == nearest_value - toward_zero,
+                        "{label} warp {warp}: {got:#x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
     for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {
@@ -735,4 +822,172 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
             assert_eq!(word, u32::from(i < active) + u32::from(i + 64 < active), "count {count}, word {i}");
         }
     }
+}
+
+/// `v_cvt_f16_f32` with `VICTORY_F16_NEAREST` on gives the IEEE round-to-nearest-even half of
+/// every f32 tried: normal halves, ties, the overflow bound, both signs; subnormal halves
+/// to within their last place.
+#[test]
+fn every_f32_converts_to_the_nearest_even_half_when_asked_to() {
+    fn rne(f: f32) -> u16 {
+        let b = f.to_bits();
+        let sign = (b >> 16 & 0x8000) as u16;
+        let a = b & 0x7FFF_FFFF;
+        if a >= 0x7F80_0000 {
+            return sign | if a > 0x7F80_0000 { 0x7E00 } else { 0x7C00 };
+        }
+        let x = f.abs() as f64;
+        // the halves around x, by brute force over the 2^15 magnitudes
+        let mut best = 0u16;
+        let mut best_d = f64::INFINITY;
+        for h in 0u16..0x7C00 {
+            let e = h >> 10;
+            let m = f64::from(h & 0x3FF);
+            let v = if e == 0 {
+                m * 2f64.powi(-24)
+            } else {
+                (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15)
+            };
+            let d = (v - x).abs();
+            if d < best_d || d == best_d && h & 1 == 0 {
+                best = h;
+                best_d = d;
+            }
+        }
+        if x >= 65520.0 {
+            best = 0x7C00;
+        }
+        sign | best
+    }
+    let words = [
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0x7E00_1501, // v_cvt_f16_f32 v0, v1
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = lower::TEST_F16_NEAREST.replace(Some(true));
+    let shader = lowered(&native, &p, &HashSet::new());
+    lower::TEST_F16_NEAREST.set(was);
+    let shader = shader.expect("lower");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut values: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        65504.0,
+        65519.0,
+        65520.0,
+        1e9,
+        2f32.powi(-14),
+        2f32.powi(-24),
+        2f32.powi(-25),
+        3.0 * 2f32.powi(-26),
+        1e-10,
+    ];
+    let mut seed = 0x1234_5678u32;
+    for _ in 0..300 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        // exponents of halves' range and a little beyond
+        let e = 100 + (seed >> 8) % 45;
+        let m = seed.wrapping_mul(2_654_435_761) & 0x7F_FFFF;
+        let bits = (seed & 0x8000_0000) | e << 23 | m;
+        values.push(f32::from_bits(bits));
+        // and the tie just above that value's half step
+        values.push(f32::from_bits(bits & !0x1FFF | 0x1000));
+    }
+    // On WARP, whose own conversion rounds toward zero as NVIDIA's does.
+    for warp in [true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        for &f in &values {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            ud[0] = f.to_bits();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            let got = (out[0][0] & 0xFFFF) as u16;
+            let want = rne(f);
+            // Below the smallest normal half the last place is the host's rounding
+            // (`Lower::console_half`): toward zero on WARP, one step below at most.
+            let subnormal = f.abs() < 2f32.powi(-14);
+            assert!(
+                got == want || subnormal && got == want - 1,
+                "warp {warp}: {f:e} ({:#010x}): got {got:#06x}, want {want:#06x}",
+                f.to_bits()
+            );
+        }
+    }
+}
+
+/// The console's `MODE.FP_ROUND` for 16-bit results, set around one conversion with
+/// `s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2)` as the title's compiler does: toward
+/// zero (3) there, to nearest (0) after it. 1 + 3.6/1024 is 0x3c03 toward zero, 0x3c04
+/// to nearest. Rounding everything to nearest posterised the title's picture; rounding
+/// everything toward zero (the host's conversion) made its upscaler run away.
+#[test]
+fn a_16_bit_result_rounds_as_the_console_mode_says() {
+    let f = 1.0f32 + 3.6 / 1024.0;
+    let words = [
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0xBA80_0881,
+        3,           // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3: toward zero
+        0x7E00_1501, // v_cvt_f16_f32 v0, v1
+        0xBA80_0881,
+        0,           // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0: to nearest even
+        0x7E04_1501, // v_cvt_f16_f32 v2, v1
+        0x3404_0490, // v_lshlrev_b32 v2, 16, v2
+        0x3800_0500, // v_or_b32 v0, v0, v2
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let was = lower::TEST_F16_NEAREST.replace(Some(true));
+    let shader = lowered(&native, &p, &HashSet::new());
+    lower::TEST_F16_NEAREST.set(was);
+    let shader = shader.expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            continue;
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        ud[0] = f.to_bits();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(out[0][0], 0x3C04_3C03, "warp {warp}: {:#x}", out[0][0]);
+        ran += 1;
+    }
+    assert!(ran > 0, "no host to run on");
 }

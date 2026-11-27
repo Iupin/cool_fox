@@ -25,7 +25,8 @@ explained in a comment where it is read, and this page quotes that comment.
 `VICTORY_WRITERS*` names were added on 2026-11-26 without re-running the
 classification; `crates/victory-gpu/src/writers.rs` counts once it is
 tracked. `VICTORY_MEMORY_FAULT_MB`, added later that day, is not counted
-either.)
+either, nor are `VICTORY_EARLY_DEPTH`, `VICTORY_DUMP_ONLY` and
+`VICTORY_DUMP_RAW`, added after it.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -201,7 +202,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_BOOK` | `crates/victory-gpu/src/book.rs:77` | true unless `0` | module: | neither |
 | `VICTORY_SLOT_CHECK` | `crates/victory-gpu/src/book.rs:86` | true if set and not `0` | `VICTORY_SLOT_CHECK=1`. | neither |
 
-### victory-gpu / capture (6)
+### victory-gpu / capture (8)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -211,6 +212,8 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_CAPTURE_WORLD` | `crates/victory-gpu/src/capture.rs:120` | true if set (any value); diag build | Whether `VICTORY_CAPTURE_WORLD` is set. | neither |
 | `VICTORY_CAPTURE_WORLD_ALSO` | `crates/victory-gpu/src/capture.rs:43` | number | `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted from that first one (the title's blue patches show from about the 118th frame on, when the window's model has arrived and the reflections hold values: none of ... | neither |
 | `VICTORY_DUMP_TARGETS` | `crates/victory-gpu/src/capture.rs:361` | on if set and not `0` | With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png` (what each ...). 1D tables of 32-bit floats logged as numbers (distinct values, equal neighbours, largest step, 17 samples); 3D textures (colour look-up tables) as their slices side by side, each texel doubled, `...-<w>x<h>x<d>-f<format>-slices.png`, with a log line counting equal neighbours along x, y and z and listing the grey diagonal. Float targets (R32G32B32A32, R32G32, R32/D32, R16G16B16A16, R16G16, R16 floats and R11G11B10; not typeless ones): a WARN `target values: texels with a NaN, +Inf or -Inf channel, or a huge one, ...` with the counts and boxes when there are any (huge: at least 1e6 for 32-bit floats, the largest value for the smaller ones), and per frame one line `dumped targets: the first in dump order with non-finite or huge texels ...` (WARN) or `... no float target has non-finite or huge texels` (INFO) | neither |
+| `VICTORY_DUMP_ONLY` | `crates/victory-gpu/src/capture.rs` (`dump_kind_wanted`) | comma list of `<w>x<h>f<dxgi format>`; unset = every kind; diag build | With `VICTORY_DUMP_TARGETS`: only targets of those kinds are dumped (a dump of every target takes seconds a frame; a few kinds can be dumped every few frames). | neither |
+| `VICTORY_DUMP_RAW` | `crates/victory-gpu/src/capture.rs` (`raw_wanted`) | comma list of `<w>x<h>f<dxgi format>`; unset = none; diag build | Dumped targets of those kinds are also written as read back, `<name>.raw` beside the PNG: width, height, row pitch and format as four little-endian words, then the rows (the PNG scales floats by their largest value and leaves non-finite ones out). | neither |
 
 ### victory-gpu / copystat (3)
 
@@ -680,15 +683,16 @@ a release build never reads them.
 | `VICTORY_PROFILE` | `crates/victory-loader/src/profile.rs:64` | schedule list; unset = off | Sampling profiler of the title's threads at the listed times (loader `profile_on_schedule`, called from diag `run`). | neither |
 | `VICTORY_STACKS` | `crates/victory-loader/src/stacks.rs:27` | seconds list (e.g. `20,60`); unset = off | Reads `VICTORY_STACKS` and, if set, starts a thread that prints every thread's stack at each listed time (seconds from now). | neither |
 
-### victory-shader (22)
+### victory-shader (23)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
 | `VICTORY_BVH_BOUNDS` | `crates/victory-gpu/src/shader_cache.rs:77`, `crates/victory-shader/src/emit/mod.rs:201` | true unless `0` | Whether the structure builder's accesses through its root views stay near them, and a size in a structure's header that cannot be one counts as none (`VICTORY_BVH_BOUNDS=0`: neither). | neither |
 | `VICTORY_BVH_FENCES` | `crates/victory-gpu/src/shader_cache.rs:76`, `crates/victory-shader/src/emit/mod.rs:192` | true unless `0` | Whether buffer atomics of the ray-tracing structure builder stand between two fences (`VICTORY_BVH_FENCES=0`: they do not). | neither |
 | `VICTORY_DESC_WHY` | `crates/victory-shader/src/emit/lower.rs:6469` | true if set (any value) | Translator debug print: `DESC-WHY` lines on stderr for descriptor tracing decisions (lower.rs:6469). | neither |
+| `VICTORY_EARLY_DEPTH` | `crates/victory-gpu/src/shader_cache.rs` (key list), `crates/victory-shader/src/emit/mod.rs` (`early_depth_on`) | true unless `0` | Whether a pixel shader the console runs after the depth and stencil tests (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, HLSL `[earlydepthstencil]`) declares `[earlydepthstencil]` on the host too; keyed into the shader cache. `0` brings back the hotspot of 2026-11-26 (`docs/bug-journal.md`). | neither |
 | `VICTORY_DXIL` | `crates/victory-shader/src/emit/validator.rs:122` | path to `dxil.dll`; unset = newest Windows SDK x64 copy, else DLL search path | Where `dxil.dll` is looked for. | neither |
-| `VICTORY_F16_NEAREST` | `crates/victory-gpu/src/shader_cache.rs:70`, `crates/victory-shader/src/emit/lower.rs:1108` | only `1` | f16 conversion rounding form; keyed into the shader cache. | neither |
+| `VICTORY_F16_NEAREST` | `crates/victory-gpu/src/shader_cache.rs:70`, `crates/victory-shader/src/emit/lower.rs` (`f16_nearest_on`) | only `1` | 16-bit float results (unpacked, packed and mixed-precision) rounded as the console's `MODE.FP_ROUND` says (to nearest even, or toward zero where a program sets it with `s_setreg`), whatever the host's conversion does (toward zero on NVIDIA and WARP). Prevents the upscaler hotspot of 2026-11-26/27, but 3 of 4 launches with it were posterised (`docs/bug-journal.md`); off by default. Keyed into the shader cache. | neither |
 | `VICTORY_FIRSTLANE_OWN` | `crates/victory-gpu/src/shader_cache.rs:72`, `crates/victory-shader/src/emit/lower.rs:8841` | true only if `1` | `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own first lane, exact when the value is the same in every lane of the console wave (the ray-tracing builder's scans read a sum of scalars this way, inside a loop whose exit is ... | neither |
 | `VICTORY_FIRST_HALF` | `crates/victory-gpu/src/shader_cache.rs:73`, `crates/victory-shader/src/emit/lower.rs:1673` | true unless `0` | A first half whose result is also read as data (an f16 second half keeps the other half of its dst, PS_DeferredTextured): evaluated as the pair it starts. | neither |
 | `VICTORY_GROUP_SYNC` | `crates/victory-shader/src/emit/mod.rs:180` | one of `0`, `1`; else default arm | (The console's barrier is the wave's, whatever lanes are live, and a wave that ended is not waited for.) `VICTORY_GROUP_SYNC`: - unset or `2`: every barrier waits, as before. - `1`: the title's `s_barrier` waits only in a ... | neither |

@@ -184,6 +184,39 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a pixel shader the console runs after the depth and stencil tests
+/// runs after them on the host too ([`early_depth`]); on unless
+/// `VICTORY_EARLY_DEPTH=0`. Part of the translation: the shader cache keys
+/// on it.
+pub fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`: the console compiler's form of
+/// HLSL's `[earlydepthstencil]`.
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
+/// Whether a pixel shader with `DB_SHADER_CONTROL` `control` and the output
+/// signature kinds `outputs` (DXIL semantic kinds) is to declare
+/// `[earlydepthstencil]`: the console tests depth and stencil before it runs
+/// (`DEPTH_BEFORE_SHADER`), so a pixel that fails them never runs and its
+/// stores to unordered views are never made. A host shader without the flag
+/// runs for every covered pixel when it writes such views (the host tests
+/// late), and stores what the console never stored: the title's glass
+/// pre-pass wrote its depth and motion over the hair in front of the window,
+/// and the upscaler's history ran away there (`docs/bug-journal.md`,
+/// 2026-11-26, the hotspot). Not with a depth, stencil or coverage output,
+/// which `[earlydepthstencil]` does not allow (none of the title's shaders
+/// has both).
+pub(crate) fn early_depth(control: u32, outputs: impl IntoIterator<Item = u8>) -> bool {
+    // SV_Depth 17, SV_DepthGreaterEqual 18, SV_DepthLessEqual 19,
+    // SV_StencilRef 20, SV_Coverage 14, SV_InnerCoverage 15.
+    control & DEPTH_BEFORE_SHADER != 0
+        && early_depth_on()
+        && !outputs.into_iter().any(|k| matches!(k, 14 | 15 | 17..=20))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
@@ -1844,6 +1877,7 @@ mod tests {
                         stride: 0,
                         size: (16, 16),
                         mesh_groups: 1,
+                        depth: None,
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
@@ -2027,6 +2061,7 @@ mod tests {
                             stride: 0,
                             size: (16, 16),
                             mesh_groups: 1,
+                            depth: None,
                         },
                     )
                     .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
@@ -2625,6 +2660,16 @@ mod barycentric_tests {
     }
 
     fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
+        pixel_controlled(words, input_addr, inputs, 0)
+    }
+
+    /// [`pixel_with_inputs`] with the console's `DB_SHADER_CONTROL`.
+    fn pixel_controlled(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[container::SigElement],
+        db_shader_control: u32,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2643,7 +2688,7 @@ mod barycentric_tests {
                     row2: 0,
                 }],
                 input_addr,
-                db_shader_control: 0,
+                db_shader_control,
                 patches: vec![],
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -2704,6 +2749,146 @@ mod barycentric_tests {
         )
         .unwrap();
         validate(&shader);
+    }
+
+    /// A vertex shader passing POSITION (row 0) and TEXCOORD (row 1) on, with
+    /// TEXCOORD in the row [`pixel`]'s programs read it from.
+    #[cfg(windows)]
+    fn passthrough_vs() -> HostShader {
+        use super::bitcode::{Attr, Term};
+        use super::shader::Shader;
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        }
+    }
+
+    /// `DB_SHADER_CONTROL` of the title's glass pre-pass (`PS_AlphaPrepass`,
+    /// 5200): early then late Z, kill, exec on no-op, depth before shader.
+    const ALPHA_PREPASS_CONTROL: u32 = 0x1450;
+
+    /// Which pixel programs declare `[earlydepthstencil]`: those the console
+    /// runs after the depth test (`DEPTH_BEFORE_SHADER`), not those it runs
+    /// first or that write depth, stencil or coverage.
+    #[test]
+    fn only_programs_tested_before_they_run_test_early() {
+        let target = [16u8];
+        assert!(early_depth(ALPHA_PREPASS_CONTROL, target));
+        assert!(early_depth(1 << 12, target));
+        // 0x50: early then late Z with kill, as most of the title's pixel
+        // programs; the host may test early or late, and does.
+        assert!(!early_depth(0x50, target));
+        assert!(!early_depth(0, []));
+        for written in [14u8, 15, 17, 18, 19, 20] {
+            assert!(
+                !early_depth(ALPHA_PREPASS_CONTROL, [16, written]),
+                "{written}"
+            );
+        }
+    }
+
+    /// The console tests depth before a pixel program whose
+    /// `DB_SHADER_CONTROL` asks for it, and then writes depth even for a
+    /// pixel the program kills; a program tested late writes no depth for
+    /// a killed pixel. A first draw kills every pixel at depth 0.5, a second
+    /// draws white at depth 0.5 with the test "less": it shows only where
+    /// the first wrote no depth. Without `[earlydepthstencil]` on the host
+    /// the first program also stored to its unordered views for pixels the
+    /// console never ran (the glass pre-pass over the hair, the hotspot).
+    #[test]
+    #[cfg(windows)]
+    fn a_program_tested_before_it_runs_writes_depth_for_killed_pixels() {
+        use super::host::{Depth, Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let [e0, e1] = exp_mrt0(0);
+        // s_mov_b32 exec_lo, 0 (every lane killed), then the done export.
+        let kill = [0xBEFE_0380u32, e0, e1, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0, exported.
+        let white = [0x7E00_02F2u32, e0, e1, 0xBF81_0000];
+        let inputs = [element("TEXCOORD", 0, 0)];
+        let vs = passthrough_vs();
+        validate(&vs);
+        let plain = pixel_controlled(&white, PERSP_CENTER, &inputs, 0).unwrap();
+        validate(&plain);
+        // One triangle over the whole 8x8 target at depth 0.5.
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            for (control, shown) in [(ALPHA_PREPASS_CONTROL, 0.0), (0x50, 1.0)] {
+                let killer = pixel_controlled(&kill, PERSP_CENTER, &inputs, control).unwrap();
+                validate(&killer);
+                let root = host.root_signature(&vs, &killer).unwrap();
+                let first = host
+                    .pipeline_depth_tested(&root, &vs.dxil, &killer.dxil)
+                    .unwrap();
+                let second = host
+                    .pipeline_depth_tested(&root, &vs.dxil, &plain.dxil)
+                    .unwrap();
+                let out = host
+                    .draw(
+                        &root,
+                        &second,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                            depth: Some(Depth {
+                                clear: 1.0,
+                                first: &first,
+                            }),
+                        },
+                    )
+                    .expect("draws with a depth target");
+                for (n, texel) in out.iter().enumerate() {
+                    assert_eq!(texel[0], shown, "{backend} control {control:#x} pixel {n}");
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no host to draw on");
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
@@ -2905,6 +3090,7 @@ mod barycentric_tests {
                             stride: 32,
                             size: (8, 8),
                             mesh_groups: 0,
+                            depth: None,
                         },
                     )
                     .expect("draw partial interpolation");

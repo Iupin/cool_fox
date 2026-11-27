@@ -617,8 +617,8 @@ switches that only work in diagnostics builds.
 | `VICTORY_EARLY_ALL`, `VICTORY_LIBRARY_MAP/_HANDLE/_LOCK/_TRIM` | `pipeline/library.rs:768`, `86`, `95`, `432`, `375` | Pipeline library |
 | `VICTORY_PIPELINE_BOOK` | `pipeline/known.rs:43` | Record every pipeline for `victory warm` |
 | `VICTORY_AMBIENT`, `_AIR`, `_SHADE` | `ambient.rs:97`, `110`, `120` | Indirect-light stand-in |
-| `VICTORY_WAVE_*`, `VICTORY_F16_NEAREST`, `VICTORY_HELPER_OWN`, `VICTORY_FIRSTLANE_OWN`, `VICTORY_FIRST_HALF`, `VICTORY_STRICT_JOINS`, `VICTORY_MESH_OUTPUT_STRICT`, `VICTORY_BVH_FENCES`, `VICTORY_BVH_BOUNDS` | `shader_cache.rs:65-77` | Read by victory-shader; **only hashed into the cache key** here |
-| `VICTORY_CAPTURE*` (incl. `VICTORY_CAPTURE_CONSTANTS`, `draw.rs`), `VICTORY_DUMP_TARGETS`, `VICTORY_AB`, `VICTORY_BARRIER_TEST`, `VICTORY_COPY_MODE`, `VICTORY_MEMORY_MAP`, `VICTORY_TIMELINE*`, `VICTORY_POP_*`, `VICTORY_FAULT_BOOK*`, `VICTORY_BOOK`, `VICTORY_SLOT_CHECK` **D** | `capture.rs:15-361`, `ab.rs:26`, `copystat.rs:179/275/532`, `timeline/record.rs:467-474`, `popwatch.rs:46/295/314`, `faultbook.rs:87`, `book.rs:77/86` | Diagnostics |
+| `VICTORY_WAVE_*`, `VICTORY_F16_NEAREST`, `VICTORY_HELPER_OWN`, `VICTORY_FIRSTLANE_OWN`, `VICTORY_FIRST_HALF`, `VICTORY_STRICT_JOINS`, `VICTORY_MESH_OUTPUT_STRICT`, `VICTORY_BVH_FENCES`, `VICTORY_BVH_BOUNDS`, `VICTORY_EARLY_DEPTH` | `shader_cache.rs:65-78` | Read by victory-shader; **only hashed into the cache key** here |
+| `VICTORY_CAPTURE*` (incl. `VICTORY_CAPTURE_CONSTANTS`, `draw.rs`), `VICTORY_DUMP_TARGETS`, `VICTORY_DUMP_ONLY`, `VICTORY_DUMP_RAW`, `VICTORY_AB`, `VICTORY_BARRIER_TEST`, `VICTORY_COPY_MODE`, `VICTORY_MEMORY_MAP`, `VICTORY_TIMELINE*`, `VICTORY_POP_*`, `VICTORY_FAULT_BOOK*`, `VICTORY_BOOK`, `VICTORY_SLOT_CHECK` **D** | `capture.rs:15-361`, `ab.rs:26`, `copystat.rs:179/275/532`, `timeline/record.rs:467-474`, `popwatch.rs:46/295/314`, `faultbook.rs:87`, `book.rs:77/86` | Diagnostics |
 | `VICTORY_BENCH_*`, `VICTORY_BLOCK_WAY`, `VICTORY_TEST_ROUNDS`, `VICTORY_SEND_CHANGED` | `indirect.rs:974-1910`, `host.rs:10135-10455` | Tests/benchmarks only |
 
 ---

@@ -398,6 +398,9 @@ pub(crate) fn dump_targets(frame: u64) {
         {
             continue;
         }
+        if !dump_kind_wanted(d.Width, d.Height, d.Format.0 as u32) {
+            continue;
+        }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         let Some(found) = dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d) else {
@@ -682,11 +685,25 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
+        let name = format!(
+            "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        if raw_wanted(d.Width, d.Height, d.Format.0 as u32)
+            && let Some(folder) = folder()
+        {
+            // Width, height, row pitch and format as four little-endian
+            // words, then the rows as read back.
+            let mut out = Vec::with_capacity(16 + rows.len());
+            for word in [f.Width, f.Height, f.RowPitch, f.Format.0 as u32] {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            out.extend_from_slice(rows);
+            if let Err(e) = std::fs::write(folder.join(format!("{name}.raw")), out) {
+                tracing::warn!(error = %e, "raw target not written");
+            }
+        }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -694,6 +711,36 @@ fn dump_one(
         buffer.Unmap(0, None);
         odd
     }
+}
+
+/// `VICTORY_DUMP_RAW=<w>x<h>f<format>,...`: dumped targets of those kinds
+/// are also written as they were read back, `<name>.raw` beside the PNG
+/// (the PNG scales floats by their largest value, which hides small ones
+/// and leaves non-finite ones out).
+fn raw_wanted(width: u64, height: u32, format: u32) -> bool {
+    static KINDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    KINDS
+        .get_or_init(|| kinds("VICTORY_DUMP_RAW"))
+        .contains(&format!("{width}x{height}f{format}"))
+}
+
+/// `VICTORY_DUMP_ONLY=<w>x<h>f<format>,...`: only targets of those kinds are
+/// dumped (a dump of every target takes seconds a frame; a few kinds can be
+/// dumped every few frames). Unset: all.
+fn dump_kind_wanted(width: u64, height: u32, format: u32) -> bool {
+    static KINDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let kinds = KINDS.get_or_init(|| kinds("VICTORY_DUMP_ONLY"));
+    kinds.is_empty() || kinds.contains(&format!("{width}x{height}f{format}"))
+}
+
+/// A comma-separated list of target kinds in switch `name`.
+fn kinds(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty())
+        .collect()
 }
 
 /// Of a 1D table: how many distinct values it holds, how many neighbours

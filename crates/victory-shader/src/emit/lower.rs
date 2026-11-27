@@ -262,6 +262,11 @@ fn half_shift(width: u32) -> u32 {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
+    /// The vector instructions (block, index) the console runs with 16-bit results
+    /// rounded toward zero ([`f16_round_toward_zero`]).
+    toward_zero: HashSet<(usize, usize)>,
+    /// Whether the instruction being lowered is one of them.
+    round_zero: bool,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -1093,12 +1098,20 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
-/// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
-/// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
-/// the last place of a result that is not exact is then one lower than the console's).
-/// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// Whether the results of 16-bit float operations (`v_add_f16`, `v_pk_fma_f16`,
+/// `v_fma_mixlo_f16`, `v_cvt_f16_f32` ...) are rounded as the console rounds them: as its
+/// `MODE.FP_ROUND` for 16-bit results says ([`f16_round_toward_zero`]), to nearest even
+/// ([`Lower::f16_nearest`]) or toward zero ([`Lower::f16_toward_zero`]), whatever the
+/// host's `f32tof16` does (toward zero on NVIDIA and on WARP: the last place of a result
+/// that is not exact is then one lower than the console's where it rounds to nearest).
+/// With `VICTORY_F16_NEAREST=1`; off by default (the host's conversion everywhere). The
+/// title's upscaler computes its network's inputs in 16 bits with the console's default
+/// rounding; toward zero they drift and its history runs away on the hair (the hotspot,
+/// `docs/bug-journal.md` 2026-11-27): with the switch no launch showed it (4 of 4), but 3
+/// of those 4 were posterised for the whole session, which no launch without it was, so
+/// it stays off until that is understood. 6,301 of the title's programs set toward zero
+/// around their packing code. The wave sum of 16-bit floats ([`Lower::half_sum`]) is
+/// always exact.
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -1106,6 +1119,79 @@ fn f16_nearest_on() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+}
+
+/// `hwreg(HW_REG_MODE)` in an `s_setreg*` immediate.
+const HW_REG_MODE: u16 = 1;
+
+/// The vector instructions (block, index) of `p` that the console runs with
+/// `MODE.FP_ROUND[3:2]` (the rounding of 16- and 64-bit results) at 3, toward zero.
+/// The mode starts at 0 (to nearest even) and changes with `s_setreg_imm32_b32
+/// hwreg(HW_REG_MODE, ...)` writing those bits (the title's compiler brackets its
+/// packing code with `hwreg(HW_REG_MODE, 2, 2)` writes of 3 and 0). A value from a
+/// register (`s_setreg_b32`), the directed modes (1, 2) and paths that join with
+/// different modes count as to nearest.
+fn f16_round_toward_zero(p: &Program) -> HashSet<(usize, usize)> {
+    const NEAREST: u8 = 0;
+    const TOWARD_ZERO: u8 = 3;
+    let mut entry: Vec<Option<u8>> = vec![None; p.blocks.len()];
+    let mut out = HashSet::new();
+    if p.blocks.is_empty() {
+        return out;
+    }
+    entry[0] = Some(NEAREST);
+    let mut work = vec![0usize];
+    while let Some(b) = work.pop() {
+        let mut mode = entry[b].unwrap_or(NEAREST);
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            match (inst.name(), &inst.fields) {
+                (
+                    "s_setreg_imm32_b32",
+                    Fields::Sop {
+                        src,
+                        imm: Some(imm),
+                        ..
+                    },
+                ) => {
+                    let (id, offset, size) = (imm & 0x3F, imm >> 6 & 0x1F, (imm >> 11 & 0x1F) + 1);
+                    if id == HW_REG_MODE && offset <= 3 && offset + size > 2 {
+                        let value = match src.first() {
+                            Some(Operand::Literal(v)) => *v,
+                            _ => 0,
+                        };
+                        // Bits 2 and 3 of MODE, as far as the field covers them.
+                        for bit in 2..4u16 {
+                            if bit >= offset && bit < offset + size {
+                                let set = value >> (bit - offset) & 1 != 0;
+                                mode = mode & !(1 << (bit - 2)) | u8::from(set) << (bit - 2);
+                            }
+                        }
+                    }
+                }
+                ("s_setreg_b32", Fields::Sop { imm: Some(imm), .. })
+                    if imm & 0x3F == HW_REG_MODE =>
+                {
+                    mode = NEAREST;
+                }
+                (_, Fields::Valu(_)) if mode == TOWARD_ZERO => {
+                    out.insert((b, i));
+                }
+                _ => {}
+            }
+        }
+        for next in p.blocks[b].exit.successors() {
+            let merged = match entry[next] {
+                None => mode,
+                Some(m) if m == mode => continue,
+                Some(_) => NEAREST,
+            };
+            if entry[next] != Some(merged) {
+                entry[next] = Some(merged);
+                work.push(next);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1399,6 +1485,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+            && super::early_depth(*db_shader_control, s.outputs.iter().map(|o| o.kind))
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1628,6 +1721,8 @@ impl<'a> Lower<'a> {
         Lower {
             s,
             x,
+            toward_zero: f16_round_toward_zero(p),
+            round_zero: false,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -3775,6 +3870,59 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let stepped = self.s.m.bin(c, Bin::Sub, h, one);
         self.s.m.select(c, away, stepped, h)
+    }
+
+    /// `f` as an f16 in the low bits, rounded as the console rounds the instruction being
+    /// lowered ([`f16_nearest_on`]): toward zero where its `MODE` says so, else to nearest
+    /// even; without `VICTORY_F16_NEAREST=1`, as the host's conversion rounds.
+    ///
+    /// The f32 is first rounded in place to the 10 fraction bits a normal half keeps (its
+    /// low 13 bits cleared, after adding 0xfff and the kept part's last bit for to
+    /// nearest even; a carry goes into the exponent as it should), so the host's
+    /// conversion has nothing left to round: six integer operations and the one
+    /// conversion. ([`Self::f16_nearest`], exact everywhere, costs four conversions and
+    /// some twenty more operations; with it on every 16-bit result the title's frames
+    /// took four times as long on the card.) To nearest, a value that rounds to 2^16 or
+    /// more becomes infinity, as IEEE has it.
+    /// shortcut: a result below the smallest normal half (2^-14) has fewer fraction bits
+    /// than that, and its last place is rounded as the host's conversion rounds (toward
+    /// zero on NVIDIA and WARP); toward zero, a value past the largest half becomes what
+    /// the host's conversion makes of it (the largest half on NVIDIA and WARP).
+    fn console_half(&mut self, f: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        if !f16_nearest_on() {
+            return self
+                .s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+        }
+        let b = self.as_int(f);
+        let kept = self.s.m.i32(0xFFFF_E000);
+        let rounded = if self.round_zero {
+            self.s.m.bin(c, Bin::And, b, kept)
+        } else {
+            let (k13, one, half) = (self.s.m.i32(13), self.s.m.i32(1), self.s.m.i32(0xFFF));
+            let last = self.s.m.bin(c, Bin::LShr, b, k13);
+            let last = self.s.m.bin(c, Bin::And, last, one);
+            let bias = self.s.m.bin(c, Bin::Add, half, last);
+            let up = self.s.m.bin(c, Bin::Add, b, bias);
+            let up = self.s.m.bin(c, Bin::And, up, kept);
+            // Past the largest half: infinity, with the sign.
+            let (magnitude, bound) = (self.s.m.i32(0x7FFF_FFFF), self.s.m.i32(0x4780_0000));
+            let size = self.s.m.bin(c, Bin::And, up, magnitude);
+            let over = self.s.m.cmp(c, pred::IUGE, size, bound);
+            let sign = self.s.m.i32(0x8000_0000);
+            let sign = self.s.m.bin(c, Bin::And, b, sign);
+            let infinity = self.s.m.i32(0x7F80_0000);
+            let infinity = self.s.m.bin(c, Bin::Or, sign, infinity);
+            let up = self.s.m.select(c, over, infinity, up);
+            // A NaN stays as it was (the addition could carry out of its payload).
+            let nan = self.s.m.cmp(c, pred::UNO, f, f);
+            self.s.m.select(c, nan, b, up)
+        };
+        let g = self.as_float(rounded);
+        self.s
+            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[g])
     }
 
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
@@ -7723,6 +7871,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        self.round_zero = self.toward_zero.contains(&(b, i));
         if let Some(&source) = self.x.res.restored_lanes.get(&(b, i)) {
             // This lane was overwritten by a uniform scalar. The previous
             // contents of other lanes can be unknown (a reduction scratch).
@@ -8512,9 +8661,8 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                // Rounded as the console rounds.
+                let h = self.console_half(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -9344,15 +9492,8 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            // The console rounds to nearest; the host's conversion may round toward zero
-            // (NVIDIA's does), one step of the last place lower where the two differ.
-            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            // As the console rounds ([`Self::console_half`]).
+            let h = l.console_half(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -9674,7 +9815,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -9710,8 +9851,8 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                // Rounded as the console rounds, as the unpacked operations are.
+                self.console_half(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
