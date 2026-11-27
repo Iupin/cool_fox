@@ -211,6 +211,23 @@ enum Piece {
     Several,
 }
 
+/// Whether the slots of fills done on the card are made on threads of their
+/// own, each thread's slots' old resources retired under one lock
+/// (`VICTORY_SLOTS_APART=0`: on the threads for the title's bytes under
+/// flights' writes, one lock each, as before). Run f1Diag1 (timeline, four
+/// frames of gameplay): the slots took 5.4 ms a frame, the helpers waiting
+/// for a landing's batch on the same threads, and some 150 times a frame
+/// each for a lock in the program's statics (taken to be the retired
+/// objects' list; the other a slot takes, the heaps' list, is read-locked).
+fn slots_apart() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SLOTS_APART") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_APART").is_none_or(|v| v != "0"))
+}
+
 fn holder_index() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_HOLDER_INDEX") {
@@ -1137,7 +1154,7 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
+        let slot = |part: usize| {
             for op in &ops {
                 if let To::Slot(heap, index) = &op.to
                     && *index as usize / 4 % parts == part
@@ -1146,7 +1163,33 @@ impl Host {
                     crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
                 }
             }
-        });
+        };
+        if slots_apart() {
+            let slots: Vec<(usize, u32, u64, u32)> = ops
+                .iter()
+                .filter_map(|op| match op.to {
+                    To::Slot(heap, index) => Some((heap, index, gpu + op.at, op.len as u32)),
+                    _ => None,
+                })
+                .collect();
+            crate::land::each_steps(parts, &|part| {
+                // By heap as they come (the same slot twice: the later last),
+                // what they held retired together.
+                let mut mine = slots.iter().filter(|s| s.1 as usize / 4 % parts == part).peekable();
+                while let Some(&&(heap, ..)) = mine.peek() {
+                    let mut run = Vec::new();
+                    while let Some(&&(h, index, at, len)) = mine.peek()
+                        && h == heap
+                    {
+                        run.push((index, at, len));
+                        mine.next();
+                    }
+                    crate::descriptor::constant_slots(heap, &own.between, run.into_iter());
+                }
+            });
+        } else {
+            crate::land::each_under(parts, &slot);
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -1842,6 +1885,36 @@ mod tests {
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();
+    }
+
+    /// What a frame's fills done on the card cost the card (ignored: a
+    /// measurement): 6,000 copies of 480 bytes as [`record`] makes them, run
+    /// and waited for, against an empty list, wall-clock medians of 15.
+    #[test]
+    #[ignore = "a measurement"]
+    fn fills_on_the_card_cost() {
+        let Some(host) = host() else {
+            return;
+        };
+        let source = host.uav_buffer(16 << 20).unwrap();
+        let time = |n: usize| {
+            let mut took = Vec::new();
+            for _ in 0..15 {
+                let own = host.own_list().unwrap();
+                let reads: Vec<(&ID3D12Resource, u64, u64, u64)> =
+                    (0..n as u64).map(|i| (&source, i * 2720 % (16 << 20), i * 512 % BETWEEN, 480)).collect();
+                record(true, &own.list.list, &own.between, &reads, &[]);
+                own.list.close();
+                let started = std::time::Instant::now();
+                host.execute(&[&own.list]);
+                took.push(started.elapsed().as_secs_f64() * 1e3);
+                POOL.lock().unwrap().push(own);
+            }
+            took.sort_by(f64::total_cmp);
+            took[took.len() / 2]
+        };
+        let (none, some) = (time(0), time(6000));
+        eprintln!("6,000 fills on the card: {some:.2} ms run and waited for, an empty list {none:.2} ms");
     }
 
     /// The whole way, in a process of its own with the relay on:

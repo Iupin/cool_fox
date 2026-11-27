@@ -120,18 +120,18 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `root.rs` | 547 | C | Root-signature serialisation and title root-signature objects |
 | `query.rs` | 148 | C | Query heaps (description only) |
 | `sampler.rs` | 211 | C | Console sampler descriptions to host samplers |
-| `descriptor.rs` | 1721 | C | Descriptor heaps, handles = addresses, view table (`VIEWS`), heap sync |
-| `descriptor/host.rs` | 5628 | C/M | Host shader-visible heaps mirroring title heaps, dynamic slots, texture slot queues, `show_after` |
+| `descriptor.rs` | 1850 | C | Descriptor heaps, handles = addresses, view table (`VIEWS`), heap sync |
+| `descriptor/host.rs` | 6034 | C/M | Host shader-visible heaps mirroring title heaps, dynamic slots, texture slot queues, `show_after` |
 | `pipeline.rs` | 919 | C | Pipeline objects, shader containers by hash, stream parsing, BVH-builder gating; the "shader translated" line names a fingerprint of the DXIL and the static samplers' console words and host filters |
 | `pipeline/host.rs` | 1597 | C | `HostPipeline::new`: our root signature and the host PSO from translated shaders; `VICTORY_ROOT_LOG`, `VICTORY_LINEAR_SAMPLERS` |
 | `pipeline/make.rs` | 614 | C | Pipeline worker threads, per-frame wait budgets, priorities |
 | `pipeline/library.rs` | 877 | C | `ID3D12PipelineLibrary` on disk, early/used/slow lists |
 | `pipeline/known.rs` | 456 | C | `VICTORY_PIPELINE_BOOK`, `victory warm` |
 | `shader_cache.rs` | 413 | C | Translated shaders on disk, keyed by translator hash + settings |
-| `host.rs` | 10258 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
+| `host.rs` | 10726 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
 | `host/aside.rs` | 92 | C | Heap buffer-view pass on `victory-aside` |
 | `host/awake.rs` | 235 | C | `VICTORY_CARD_AWAKE`: keeps GPU clocks up |
-| `host/card_steps.rs` | 1781 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
+| `host/card_steps.rs` | 2041 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
 | `host/indirects.rs` | 134 | D | What indirect executions ran, for device-removed reports |
 | `host/panel.rs` | 442 | D | On-screen numbers (`VICTORY_PANEL`, F3) |
 | `host/place.rs` | 328 | C/M | Buffer copies done on the card at their place |
@@ -154,7 +154,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `book.rs` | 699 | D | Who owns which card memory (`VICTORY_BOOK`) |
 | `timeline.rs` + `timeline/{hooks,record,report}.rs` | 51+304+621+914 | C/D | `span()` (no-op without diagnostics), Chrome trace (`VICTORY_TIMELINE`) |
 | `shadow.rs` | 5307 | M | Host copies of title buffers |
-| `watch.rs` | 4604 | M | Write watching / guards |
+| `watch.rs` | 4946 | M | Write watching / guards |
 | `watched.rs` | 160 | M | Write-watched reservations for big blocks of host memory handed to the title (the title's allocator, device heaps; `VICTORY_WATCHED_HEAP`, [memory doc §3.3](victory-gpu-memory.md)) |
 | `writers.rs` | 2215 | M | The writers watch: which code writes a range of title memory, and what (`VICTORY_WRITERS*`, read in diagnostics builds; [memory doc §3.4a](victory-gpu-memory.md)) |
 | `resource.rs` | 4390 | M | Heaps, resources, host textures (`HostTexture`, `host_transition`) |
@@ -169,7 +169,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `inplace.rs` | 1387 | M | Title memory opened as host heaps |
 | `safecopy.rs` | 699 | M | Fault-tolerant copies |
 | `titlewrite.rs`, `titlewrite/decode.rs` | 425+697 | M | Stores done in the title's place; `store_extent` gives the writers watch a store's size |
-| `land.rs`, `land/tests.rs` | 655+457 | M | Landing threads |
+| `land.rs`, `land/tests.rs` | 710+470 | M | Landing threads; the pools of helper threads (landing, title bytes under flights' writes, card-step slots, views and records) |
 | `replay/**` | ~12k | M/D | Frame record and replay (`docs/replay.md`) |
 | `build.rs` | 42 | C | Translator fingerprint |
 | `tests/replay.rs`, `tests/replay_big.rs` | 1806+387 | M/D | Replay integration tests |

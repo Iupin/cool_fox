@@ -563,7 +563,11 @@ Copies at their place (`place.rs`, below) and card steps (2026-11-27):
   the slots 5.4 ms a frame, choosing 2.9, the list 2.5, what holds their
   bytes 1.5). What holds each fill's bytes is looked up by pieces of memory
   (`ByPiece`, `VICTORY_HOLDER_INDEX`, on) instead of over every range the
-  flights declared.
+  flights declared; the slots are made on threads of their own
+  (`land::each_steps`, `VICTORY_SLOTS_APART`, on), not on those the landing
+  also uses (a pool runs one batch at a time, and the slots waited for a
+  landing's), and what the slots held before is retired under one lock per
+  thread (`descriptor::constant_slots`, `host::retire_resources`).
 
 `host/place.rs` (`VICTORY_COPIES_IN_PLACE`, on): the title's buffer copy runs in
 the destination's host copy at its list position. Its bytes count as a shader
@@ -919,6 +923,7 @@ launcher sets, with the value it sets.
 | `VICTORY_PLACED_FORWARD` | host/card_steps.rs `placed_forward` | on | A fill behind an in-place copy that reads only its bytes is done on the card from the copy's source (§3.7); `0`: refused, the submission waits. |
 | `VICTORY_CARD_STEPS_CHECK` | host/card_steps.rs `check` | off | `1`: what those fills were given is read back and compared with title memory after the landing (a warning per frame line if any differ). |
 | `VICTORY_HOLDER_INDEX` | host/card_steps.rs `holder_index` | on | What holds a card step's bytes is looked up by pieces of memory; `0`: over every declared range, per fill. |
+| `VICTORY_SLOTS_APART` | host/card_steps.rs `slots_apart` | on | The slots of card-step fills are made on threads of their own (`VICTORY_STEPS_THREADS`, 4), retired in one lock per thread; `0`: on the threads the landing uses too. |
 | `VICTORY_COPIES_IN_PLACE` | host/place.rs:43 | on | Title buffer copies on the card at their list position. |
 | `VICTORY_FILL_TITLE` | host.rs:2809 | off | An experiment named in the card-steps docs. |
 | `VICTORY_JOIN_COPIES` | host.rs:3773 | off; **L**=1 | Join adjacent title copies into one kernel copy. |

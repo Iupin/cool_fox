@@ -28,8 +28,9 @@ tracked. The first three rows were recounted on 2026-11-27, after
 `VICTORY_WATCHED_HEAP`, `VICTORY_ASK_REFUSED`, `VICTORY_CARD_TOUCHED` and
 `VICTORY_RELOOK_MS` were added; "read by product code" is the old count
 plus those four, not reclassified. `VICTORY_PLACED_FORWARD`,
-`VICTORY_CARD_STEPS_CHECK` and `VICTORY_HOLDER_INDEX` were added later that day
-and are not counted in the rows above.)
+`VICTORY_CARD_STEPS_CHECK`, `VICTORY_HOLDER_INDEX`, `VICTORY_SLOTS_APART` and
+`VICTORY_STEPS_THREADS` were added later that day and are not counted in
+the rows above.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -304,7 +305,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_LATE_WAITS` | `crates/victory-gpu/src/frame.rs:144` | true only if `1` | `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before. | neither |
 
-### victory-gpu / host (50)
+### victory-gpu / host (51)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -340,6 +341,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_PLACED_FORWARD` | `crates/victory-gpu/src/host/card_steps.rs` `placed_forward` | true unless `0` | Whether a fill behind a copy at its place in a list that reads only bytes the copy writes is done on the card from the copy's source (`VICTORY_PLACED_FORWARD=0`: refused, the submission waits), and a copy at its place is in the way only of what stands behind it, as with `VICTORY_PLACED_ORDER=1` (without its cut). | neither |
 | `VICTORY_CARD_STEPS_CHECK` | `crates/victory-gpu/src/host/card_steps.rs` `check` | true only if `1` | Diagnostics, not for timed runs: the bytes each fill read through a copy at its place was given are read back and compared with title memory there when the submission has landed. | neither |
 | `VICTORY_HOLDER_INDEX` | `crates/victory-gpu/src/host/card_steps.rs` `holder_index` | true unless `0`; diag build; `VICTORY_AB`-switchable | What writers write, by pieces of title memory: [`holder`] looks there instead of at every writer (`VICTORY_HOLDER_INDEX=0`: every writer for every fill, as before). | neither |
+| `VICTORY_SLOTS_APART` | `crates/victory-gpu/src/host/card_steps.rs` `slots_apart` | true unless `0`; diag build; `VICTORY_AB`-switchable | Whether the slots of fills done on the card are made on threads of their own, each thread's slots' old resources retired under one lock (`VICTORY_SLOTS_APART=0`: on the threads for the title's bytes under flights' writes, one lock each, as before). | neither |
 | `VICTORY_REFRESH_AHEAD` | `crates/victory-gpu/src/host.rs:7679` | true unless `0` | Whether the copies that a submission's shaders write are brought up to date together, on several threads, ahead of its steps (`VICTORY_REFRESH_AHEAD=0`: each before the step that gives it to them). 580 copies a frame, one ... | neither |
 | `VICTORY_REFRESH_FRONT` | `crates/victory-gpu/src/host.rs:7698` | on if set and not `0` | Whether everything a submission refreshes is brought up to date in one go, on several threads, ahead of its steps (`VICTORY_REFRESH_FRONT=1`, and with `VICTORY_JOIN_PARTS`, which needs it; else in groups where the steps ask ... | neither |
 | `VICTORY_RELAY` | `crates/victory-gpu/src/host.rs:2484`, `crates/victory-gpu/src/shadow.rs:1107` | unset or `2`: stage 2; `1`: stage 1 (when the relay is on) | Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default since the walls of the first room were found drawn in every run with this set and in fewer than half without it). | play.ps1=`2`; cmd=`2` |
@@ -375,7 +377,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_INPLACE_PROBE` | `crates/victory-gpu/src/inplace.rs:62` | number; default `0` | `VICTORY_INPLACE_PROBE`: 0 (unset) nothing; 1 the probe on memory of its own at the first sweep, and the census 30 and 150 seconds later; 2 also opens one part of the title's own memory for a moment at the first census. | neither |
 | `VICTORY_INPLACE_PROBE_MB` | `crates/victory-gpu/src/inplace.rs:1236` | number; default `64usize` | module: | neither |
 
-### victory-gpu / land (8)
+### victory-gpu / land (9)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -385,6 +387,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_LAND_SKIP` | `crates/victory-gpu/src/land.rs:69` | true only if `1` | `VICTORY_LAND_SKIP=1`, off by default: counted either way). | neither |
 | `VICTORY_LAND_TAKEN` | `crates/victory-gpu/src/land.rs:511` | true unless `0` | Whether a copy a landing went through is noted as up to date with it (`VICTORY_LAND_TAKEN=0`: it is not, and the next refresh copies the 64 KiB again and sends them up to the card, as before). | neither |
 | `VICTORY_LAND_THREADS` | `crates/victory-gpu/src/land.rs:54` | number | How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`). | neither |
+| `VICTORY_STEPS_THREADS` | `crates/victory-gpu/src/land.rs` `each_steps` | number; default 4 | Threads kept for the slots of the steps done on the card, with the calling one. | neither |
 | `VICTORY_UNDER_THREADS` | `crates/victory-gpu/src/land.rs:336` | number; default `6usize` | [`Pool::each`] on threads kept for the title's bytes under flights' writes (`VICTORY_UNDER_THREADS`, 6 with this one). | neither |
 | `VICTORY_VIEW_THREADS` | `crates/victory-gpu/src/land.rs:351` | number | Calls `f` with every number below `count`, on this thread and on threads kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1: on this one alone). | neither |
 
