@@ -9,10 +9,10 @@ explained in a comment where it is read, and this page quotes that comment.
 
 | set | count | how |
 |---|---:|---|
-| distinct `VICTORY_*` names anywhere in tracked files | **354** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
-| distinct names in `.rs` files (code and comments) | 353 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
-| distinct names as a string literal `"VICTORY_..."` in `.rs` | 352 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
-| **read by product code** (tables below) | **322** | literal outside test modules/files, not only a `.env()` set or `==` compare |
+| distinct `VICTORY_*` names anywhere in tracked files | **361** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
+| distinct names in `.rs` files (code and comments) | 357 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
+| distinct names as a string literal `"VICTORY_..."` in `.rs` | 356 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
+| **read by product code** (tables below) | **326** | literal outside test modules/files, not only a `.env()` set or `==` compare |
 | of those, build-time `env!` values (not user settings) | 3 | `VICTORY_TRANSLATOR`, `VICTORY_SHADER_SOURCE_HASH`, `VICTORY_SHADER_SWITCHES` |
 | of those, set by `victory` itself for its own child processes | 2 | `VICTORY_AUDIO_CAPTURE_OF`, `VICTORY_RELAUNCHED_FROM` |
 | read only by tests / benchmarks / test child processes | 30 | [Test-only](#test-only-and-child-process-names) |
@@ -24,7 +24,10 @@ explained in a comment where it is read, and this page quotes that comment.
 322 + 30 + 1 = 353 names in `.rs`; + 1 doc-only = 354. (The six
 `VICTORY_WRITERS*` names were added on 2026-11-26 without re-running the
 classification; `crates/victory-gpu/src/writers.rs` counts once it is
-tracked.)
+tracked. The first three rows were recounted on 2026-11-27, after
+`VICTORY_WATCHED_HEAP`, `VICTORY_ASK_REFUSED`, `VICTORY_CARD_TOUCHED` and
+`VICTORY_RELOOK_MS` were added; "read by product code" is the old count
+plus those four, not reclassified.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside

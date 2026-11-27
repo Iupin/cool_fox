@@ -366,7 +366,9 @@ Job::Run/Joined.go ─► Host::execute_parts ─► card_steps::cut_for may spl
         9 batch.flush, shadow::take_snapshots
        10 picked::declare, declared_writes, card_before (sends up + compare list)
        11 drop heap sync guard (wait), descriptor::make_waiting
-       12 queue.ExecuteCommandLists(per part) ; queue.Signal(fence, ++submitted)
+       12 queue.ExecuteCommandLists(per part) ; the card compare in a call of its own
+          (buffers promoted to COPY_DEST decay to COMMON first: D3D12 error 538;
+          from rorodev6/victory-nvidia-megafork d1fe0bd) ; queue.Signal(fence, ++submitted)
    ◄─ Sent { back ranges, writes, card plan } ─► LINE.push(Late::Run(Flight)), Late::Write..
    relay_wait if ≥ VICTORY_LATE_WAIT_LISTS (256) lists in the air
 
