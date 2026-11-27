@@ -1104,21 +1104,45 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// ([`Lower::f16_nearest`]) or toward zero ([`Lower::f16_toward_zero`]), whatever the
 /// host's `f32tof16` does (toward zero on NVIDIA and on WARP: the last place of a result
 /// that is not exact is then one lower than the console's where it rounds to nearest).
-/// With `VICTORY_F16_NEAREST=1`; off by default (the host's conversion everywhere). The
-/// title's upscaler computes its network's inputs in 16 bits with the console's default
-/// rounding; toward zero they drift and its history runs away on the hair (the hotspot,
-/// `docs/bug-journal.md` 2026-11-27): with the switch no launch showed it (4 of 4), but 3
-/// of those 4 were posterised for the whole session, which no launch without it was, so
-/// it stays off until that is understood. 6,301 of the title's programs set toward zero
-/// around their packing code. The wave sum of 16-bit floats ([`Lower::half_sum`]) is
-/// always exact.
+/// For every program with `VICTORY_F16_NEAREST=1`, else for the programs translated
+/// inside [`with_console_f16`] (the caller's scope: `victory-gpu` puts the programs of the
+/// images or hashes `VICTORY_F16_NEAREST` lists there; none by default),
+/// else the host's conversion. The title's upscaler computes its network's inputs in 16
+/// bits with the console's default rounding; toward zero they drift and its history runs
+/// away on the hair (the hotspot, `docs/bug-journal.md` 2026-11-27). Rounded as the
+/// console does, for every program or for the upscaler's alone, no launch showed the
+/// hotspot, but some were posterised, which is why it is not on by default. 6,301 of
+/// the title's programs set toward zero around their packing code. The wave sum of 16-bit
+/// floats ([`Lower::half_sum`]) is always exact.
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
     }
+    CONSOLE_F16.get() || f16_nearest_everywhere()
+}
+
+/// `VICTORY_F16_NEAREST=1`: every program rounds its 16-bit results as the console does.
+pub fn f16_nearest_everywhere() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// Whether the program being translated on this thread rounds its 16-bit results as
+    /// the console does ([`with_console_f16`]).
+    static CONSOLE_F16: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with the 16-bit float results of the programs it translates on this
+/// thread rounded as the console rounds them when `on` ([`f16_nearest_on`]); with `on`
+/// false, as the switch says. A translation made with it differs from one made without:
+/// a cache of translations must key them apart.
+pub fn with_console_f16<R>(on: bool, translate: impl FnOnce() -> R) -> R {
+    let before = CONSOLE_F16.replace(on);
+    let result = translate();
+    CONSOLE_F16.set(before);
+    result
 }
 
 /// `hwreg(HW_REG_MODE)` in an `s_setreg*` immediate.

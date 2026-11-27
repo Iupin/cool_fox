@@ -28,6 +28,13 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    // The GPU side tells programs by the image the title passes them from
+    // (`victory_gpu::shader_cache::console_f16_for`).
+    #[cfg(windows)]
+    victory_gpu::shader_cache::note_title_image(
+        base,
+        path.file_name().map(|n| n.to_string_lossy().into_owned()),
+    );
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
@@ -35,6 +42,8 @@ pub fn set_image_path(base: usize, path: &Path) {
 
 /// Forgets a title image that was unmapped again.
 pub fn forget_image(base: usize) {
+    #[cfg(windows)]
+    victory_gpu::shader_cache::note_title_image(base, None);
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
 }

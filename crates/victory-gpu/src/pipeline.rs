@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its 16-bit float results rounded as the console rounds them
+    /// (`shader_cache::console_f16_for`: the title passed it from an image
+    /// `VICTORY_F16_NEAREST` names, e.g. AMD's upscaler; none by default).
+    console_f16: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -100,8 +104,10 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
-/// The shared container for `bytes`.
-fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+/// The shared container for `bytes`, which the title passed at `from` (if
+/// known: `console_f16` as [`Shader`] has it; the first caller's place
+/// counts for the same bytes).
+fn shader(stage: &'static str, bytes: &[u8], from: Option<usize>) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -110,10 +116,20 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
+            #[cfg(windows)]
+            let console_f16 =
+                from.is_some_and(|at| crate::shader_cache::console_f16_for(at, &hash));
+            #[cfg(not(windows))]
+            let console_f16 = {
+                let _ = from;
+                false
+            };
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash,
                 container: bytes.to_vec(),
+                console_f16,
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -148,7 +164,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, self.console_f16);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -204,7 +220,7 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], console_f16: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -213,7 +229,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader(container, console_f16)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -598,9 +614,11 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
         return None;
     }
     // SAFETY: the title passes `size` bytes of shader code.
-    Some(shader(stage, unsafe {
-        std::slice::from_raw_parts(code.code, code.size)
-    }))
+    Some(shader(
+        stage,
+        unsafe { std::slice::from_raw_parts(code.code, code.size) },
+        Some(code.code as usize),
+    ))
 }
 
 fn hand_out(

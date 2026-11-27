@@ -158,6 +158,9 @@ Run-time lookups go through `kernel.rs`:
   rewriting. Title images go to the host's `GetProcAddress` (real exports).
 - `GetModuleHandle*(NULL)` → title image; `GetModuleFileName*` → the
   original file path recorded by `set_image_path`, not the cache copy.
+  `set_image_path` and `forget_image` also tell `victory_gpu::shader_cache::note_title_image`
+  the image's file name, by which `VICTORY_F16_NEAREST` can name the programs the
+  title passes from it.
   `FreeLibrary` on pseudo handles and title images is a no-op success.
 
 ## COM-like console interfaces

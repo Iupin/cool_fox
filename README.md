@@ -81,6 +81,14 @@ Known here and not solved:
 
 - Some characters' skin is black in some launches, with or without the fault
   above (perhaps textures that arrive late; not looked into).
+- **A bright hotspot grows from the player's hair** about 450 frames into the
+  first scene until the picture is white (4 launches of 5 on 2026-11-27). The
+  cause is 16-bit float rounding in the title's AMD upscaler;
+  `VICTORY_F16_NEAREST=amd_fidelityfx_upscaler_xbox.dll` removed it in 7
+  launches of 7, but is not the default yet.
+- **Posterisation is back**: since about 00:30 on 2026-11-27, 10 of 16
+  launches were posterised for the whole session again, with ray tracing on
+  and whatever the rounding (`docs/bug-journal.md`, 2026-11-27).
 - **The frame is bound by the CPU**: about 66 ms of 100 is the layer
   preparing submissions.
 - More is wrong in the open world; it has not been written down yet.

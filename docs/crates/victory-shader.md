@@ -466,7 +466,9 @@ added in `8cc31ab` ("archived kernels … validated wave32 PSOs on RTX").
   writes FMax/FMin, legacy mul, med3 and fract as single host ops (`emit/mod.rs:226-263`).
 - `group_sync()` exists because NVIDIA's barrier waits for every thread and hangs the
   card when some never arrive (`emit/mod.rs:160-185`).
-- **16-bit float rounding** (`VICTORY_F16_NEAREST=1`; off by default): the host's `f32tof16`
+- **16-bit float rounding** (off by default; `VICTORY_F16_NEAREST=1` for every
+  program, or a list of images or program hashes, e.g.
+  `amd_fidelityfx_upscaler_xbox.dll`): the host's `f32tof16`
   rounds toward zero on NVIDIA and on WARP; the console rounds 16-bit results as
   `MODE.FP_ROUND[3:2]` says, to nearest even unless a program sets toward zero.
   `f16_round_toward_zero` (`lower.rs`) follows `s_setreg_imm32_b32
@@ -488,8 +490,18 @@ added in `8cc31ab` ("archived kernels … validated wave32 PSOs on RTX").
   hotspot). With the switch no launch showed the hotspot (4 of 4: twice
   everything to nearest, twice as `MODE` says), but 3 of the 4 were posterised
   for the whole session, which none of about 12 launches without it (ray
-  tracing on) was; so it is off by default until that is understood
-  (`docs/bug-journal.md`, 2026-11-27).
+  tracing on) was at the time (`docs/bug-journal.md`, 2026-11-27). **Scope:**
+  `f16_nearest_on` is true with the switch at `1`, or for programs
+  translated inside `emit::with_console_f16(true, ..)` (a thread-local the
+  caller sets around `translate`). `victory-gpu` sets it for a program the
+  title passes from an image the switch names, or whose hash it names
+  (`shader_cache.rs` `console_f16_for`: the image holding the bytecode
+  pointer, by the title file the loader mapped it from; the upscaler DLL
+  holds 29 compute programs, the accumulate pass among them), and keys
+  those translations apart in the shader cache. With the upscaler's scope:
+  hotspot in 0 of 7 launches, posterised 2 of 7; with the host's rounding in
+  the same hours: hotspot 4 of 5, posterised 5 of 5. Not the default yet,
+  because the proof asked for (5 launches each clean) was not met.
 
 ### Mesh shaders
 
@@ -619,7 +631,7 @@ part of the runtime cache key (§6).
 | `VICTORY_WAVE_OWN_BITS` | `0` off (on) | `own_bits` proof for wave ORs in split wave64 | `lower.rs:1121`; key |
 | `VICTORY_FIRST_HALF` | `0` off (on) | during the FIRST_HALF retry, evaluate first halves as pairs | `lower.rs:1673`; key |
 | `VICTORY_FIRSTLANE_OWN` | `1` on (off) | *approximate*: first-lane read where not every lane runs takes the host wave's own first lane | `lower.rs:8841`; key |
-| `VICTORY_F16_NEAREST` | `1` on (off) | 16-bit float results rounded as the console's `MODE` says (to nearest, or toward zero where a program sets it), not by the host's conversion (toward zero); cures the upscaler hotspot, posterised 3 of 4 launches | `lower.rs` `f16_nearest_on`; key |
+| `VICTORY_F16_NEAREST` | `1` every program, a comma list of image names / program hashes those programs (off) | 16-bit float results rounded as the console's `MODE` says (to nearest, or toward zero where a program sets it), not by the host's conversion (toward zero); `amd_fidelityfx_upscaler_xbox.dll` cures the upscaler hotspot (0 of 7 launches) | `lower.rs` `f16_nearest_on`, `victory-gpu` `shader_cache.rs` `console_f16_for`; key |
 | `VICTORY_STRICT_JOINS` | set (off) | refuse joins fed by values with no DXIL form instead of silently zero (40 programs stop with it) | `lower.rs:12622`; key |
 | `VICTORY_MESH_OUTPUT_STRICT` | set (off) | refuse mesh shaders over 32 KiB of outputs even at lane-count maxima | `lower.rs:4630`; key |
 | `VICTORY_WAVE_WHY` | set (off) | stderr `WAVE64-WHY`/`-RETRY`/`-FORM`/`-WIDE` diagnostics. Read uncached each time | `lower.rs:1502,1706`; `emit/mod.rs:458,651` |

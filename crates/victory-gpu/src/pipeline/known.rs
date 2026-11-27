@@ -265,7 +265,10 @@ fn parse(
         rest = after;
         let mut hash = [0; 32];
         hash.copy_from_slice(&head[1..]);
-        shaders.push(super::shader(STAGES.get(usize::from(head[0]))?, &read(&hash)?));
+        // (Where the title passed it from is not written down: a program of
+        // the upscaler is made here with the host's 16-bit rounding, and
+        // again in the run with the console's.)
+        shaders.push(super::shader(STAGES.get(usize::from(head[0]))?, &read(&hash)?, None));
     }
     let (&graphics, rest) = rest.split_first()?;
     let g = match graphics {

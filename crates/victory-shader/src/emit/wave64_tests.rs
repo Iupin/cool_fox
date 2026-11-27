@@ -591,6 +591,70 @@ fn packed_and_mixed_16_bit_results_round_to_nearest_when_asked_to() {
     }
 }
 
+/// The caller's scope ([`lower::with_console_f16`], how `victory-gpu` gives the title's
+/// upscaler the console's rounding without `VICTORY_F16_NEAREST=1`): a packed sum
+/// translated inside it rounds to nearest on WARP and the hardware card, the translation
+/// outside it is another (the host's conversion, unless the switch asks for every
+/// program), and the scope ends with the call.
+#[test]
+fn a_program_translated_in_the_console_f16_scope_rounds_to_nearest() {
+    let packed = [
+        0x7E0E_02FF,
+        0x3C03_3C03, // v_mov_b32 v7, 0x3c033c03
+        0x7E0C_02FF,
+        0x4000_4000, // v_mov_b32 v6, 0x40004000
+        0xCC0F_4000,
+        3 << 27 | 262 << 9 | 263, // v_pk_add_f16 v0, v7, v6
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&packed);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let was = lower::TEST_F16_NEAREST.replace(None);
+    let inside = lower::with_console_f16(true, || lowered(&native, &p, &HashSet::new()));
+    let outside = lowered(&native, &p, &HashSet::new());
+    let off = lower::with_console_f16(false, || lowered(&native, &p, &HashSet::new()));
+    lower::TEST_F16_NEAREST.set(was);
+    let (inside, outside, off) = (
+        inside.expect("lower"),
+        outside.expect("lower"),
+        off.expect("lower"),
+    );
+    if !lower::f16_nearest_everywhere() {
+        assert_ne!(inside.dxil, outside.dxil, "the scope changes the translation");
+    }
+    assert_eq!(outside.dxil, off.dxil, "a scope that is off is no scope");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = inside.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let Ok((root, pso)) = host.compute_pipeline(&inside) else {
+            continue;
+        };
+        let ud = vec![0u32; inside.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let got = out[0][0];
+        eprintln!("packed 0x3c03 + 0x4000 in the scope, warp {warp}: {got:#x}");
+        assert_eq!(got, 0x4202_4202, "warp {warp}");
+    }
+}
+
 #[test]
 fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
     for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {

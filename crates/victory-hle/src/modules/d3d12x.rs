@@ -39,28 +39,30 @@ fn host_gpu_failed(what: &str) -> ! {
 
 /// Translates `container` into the cache ([`use_shader_cache`]) ahead of
 /// any run: whether it was there already, or why it does not translate.
-pub fn precompile(container: &[u8]) -> Result<bool, String> {
+/// `image`: the file it was found in, when that is an image the title maps
+/// (its programs may round 16-bit floats as the console does).
+pub fn precompile(container: &[u8], image: Option<&str>) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::precompile(container)
+        victory_gpu::shader_cache::precompile(container, image)
     }
     #[cfg(not(windows))]
     {
-        let _ = container;
+        let _ = (container, image);
         Err("no host".into())
     }
 }
 
 /// The fork's offline warm-up (`victory translate --warm`), by
 /// [`precompile`]: whether it was translated now.
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+pub fn warm_shader(container: &[u8], image: Option<&str>) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
+        victory_gpu::shader_cache::precompile(container, image).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {
-        let _ = container;
+        let _ = (container, image);
         Err("no shader cache on this host".into())
     }
 }

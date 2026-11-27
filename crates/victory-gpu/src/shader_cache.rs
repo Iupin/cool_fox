@@ -105,22 +105,177 @@ pub(crate) fn translation() -> [u8; 32] {
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card
 /// can do decides the form of some programs.
-pub fn precompile(container: &[u8]) -> Result<bool, String> {
+///
+/// `image`: the file name of the image the container was found in (a
+/// program the title passes from an image `VICTORY_F16_NEAREST` names is
+/// translated with the console's 16-bit rounding, [`console_f16_for`]).
+pub fn precompile(container: &[u8], image: Option<&str>) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
+    let scope = f16_scope(std::env::var("VICTORY_F16_NEAREST").ok().as_deref());
+    let program = &blake3::hash(container).to_hex()[..16];
+    host_shader(container, in_f16_scope(&scope, image, program))?;
     // (Counts other threads' misses too: the caller only adds them up.)
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+/// there is one. `console_f16`: its 16-bit float results rounded as the
+/// console rounds them ([`console_f16_for`]); such translations are cached
+/// apart from the others.
+pub(crate) fn host_shader(container: &[u8], console_f16: bool) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| {
+        victory_shader::emit::with_console_f16(console_f16, || victory_shader::emit::translate(c))
+            .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &scoped(build(), console_f16), container, translate),
         None => translate(container),
     }
+}
+
+/// The key of translations made with the console's 16-bit rounding for
+/// their program alone: `build` hashed once more.
+fn scoped(build: [u8; 32], console_f16: bool) -> [u8; 32] {
+    if !console_f16 {
+        return build;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(b"console f16 rounding");
+    *hash.finalize().as_bytes()
+}
+
+/// Which programs round their 16-bit float results as the console does
+/// (`VICTORY_F16_NEAREST`; the translator's `with_console_f16`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum F16Scope {
+    /// `1`: every program (the translator reads the switch itself).
+    All,
+    /// `0`: none, the host's conversion everywhere (toward zero on NVIDIA
+    /// and WARP).
+    None,
+    /// The programs whose bytes the title passed from these images (file
+    /// names, lower case), and the programs named by their hash as the log
+    /// gives it (16 hex digits of the container's BLAKE3; for experiments).
+    Images(Vec<String>),
+}
+
+/// `VICTORY_F16_NEAREST`: unset, empty or `0` none (the default: the host's
+/// conversion everywhere), `1` every program, else a comma list of image
+/// file names and program hashes. The candidate for a default is
+/// `amd_fidelityfx_upscaler_xbox.dll` (AMD's FidelityFX upscaler for Xbox,
+/// middleware a title ships beside its executable): its accumulate pass
+/// computes its network's inputs in 16 bits and with the host's rounding
+/// toward zero its history ran away (the hotspot). With that scope no launch
+/// of 7 had the hotspot, but 2 of the 7 were posterised (with the host's
+/// rounding: hotspot 4 of 5, posterised 5 of 5), so it is not the default
+/// yet (`docs/bug-journal.md` 2026-11-27).
+fn f16_scope(value: Option<&str>) -> F16Scope {
+    match value.map(str::trim) {
+        Some("1") => F16Scope::All,
+        Some(list) if !list.is_empty() && list != "0" => F16Scope::Images(
+            list.split(',')
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+        ),
+        _ => F16Scope::None,
+    }
+}
+
+/// Whether a program the title passed from the image named `image` (its
+/// file name; `None`: not from an image, e.g. read from the title's archives
+/// into its heap), whose container's hash is `program`, is translated inside
+/// the translator's console-rounding scope. With `VICTORY_F16_NEAREST=1` the
+/// translator rounds every program so already, and none needs the scope.
+fn in_f16_scope(scope: &F16Scope, image: Option<&str>, program: &str) -> bool {
+    match scope {
+        F16Scope::Images(names) => names.iter().any(|name| {
+            name.eq_ignore_ascii_case(program)
+                || image.is_some_and(|image| name.eq_ignore_ascii_case(image))
+        }),
+        _ => false,
+    }
+}
+
+/// Whether the program in a container the title passed at `address`, whose
+/// hash is `program`, gets the console's 16-bit rounding: whether the image
+/// holding `address` is one `VICTORY_F16_NEAREST` names ([`f16_scope`]), or
+/// the program is. The first program of each image is logged.
+#[cfg(windows)]
+pub(crate) fn console_f16_for(address: usize, program: &str) -> bool {
+    static SCOPE: OnceLock<F16Scope> = OnceLock::new();
+    let scope = SCOPE.get_or_init(|| {
+        let scope = f16_scope(std::env::var("VICTORY_F16_NEAREST").ok().as_deref());
+        tracing::info!(?scope, "16-bit float results rounded as the console does for");
+        scope
+    });
+    if !matches!(scope, F16Scope::Images(_)) {
+        return false;
+    }
+    let image = image_name(address);
+    let on = in_f16_scope(scope, image.as_deref(), program);
+    if on {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(image) = image.filter(|i| !seen.contains(i)) {
+            tracing::info!(
+                image = %image,
+                program,
+                at = format_args!("{address:#x}"),
+                "first program of this image: its 16-bit float results rounded as the console does"
+            );
+            seen.push(image);
+        }
+    }
+    on
+}
+
+/// The title's images by their base, with the name of the file each was
+/// mapped from (the loader maps a prepared copy called
+/// `victory-image-<hash>.dll`, so Windows does not know the title's name).
+static TITLE_IMAGES: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The title image at `base` was mapped from the file `name` (`None`: it
+/// is unmapped again).
+pub fn note_title_image(base: usize, name: Option<String>) {
+    let mut images = TITLE_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    images.retain(|(b, _)| *b != base);
+    images.extend(name.map(|name| (base, name)));
+}
+
+/// The name of the title file whose image `address` lies in, if it lies in
+/// one; for an image that is not the title's, its own file name.
+#[cfg(windows)]
+fn image_name(address: usize) -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: looks the image up by an address in it; no reference is taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    } != 0;
+    if !found {
+        return None;
+    }
+    let base = module as usize;
+    let images = TITLE_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, name)) = images.iter().find(|(b, _)| *b == base) {
+        return Some(name.clone());
+    }
+    drop(images);
+    let mut path = [0u16; 260];
+    // SAFETY: `module` is a mapped image; the buffer's length is passed.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    path.rsplit(['\\', '/']).next().map(str::to_owned)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -426,6 +581,51 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn the_console_f16_scope_is_the_images_and_programs_the_switch_names() {
+        const P: &str = "0123456789abcdef";
+        let upscaler = Some("AMD_FidelityFX_Upscaler_Xbox.dll");
+        // Unset, empty or `0`: nowhere; `1`: everywhere, which the
+        // translator does on its own.
+        for value in [None, Some(""), Some("  "), Some("0"), Some("1")] {
+            assert!(!in_f16_scope(&f16_scope(value), upscaler, P), "{value:?}");
+        }
+        let scope = f16_scope(Some("amd_fidelityfx_upscaler_xbox.dll"));
+        assert!(in_f16_scope(&scope, upscaler, P));
+        assert!(!in_f16_scope(&scope, Some("game_scarlett_master.exe"), P));
+        assert!(!in_f16_scope(&scope, Some("XboxBvhBuilder.dll"), P));
+        assert!(!in_f16_scope(&scope, None, P), "a program from the heap");
+        assert_eq!(f16_scope(Some("1")), F16Scope::All);
+        let listed = f16_scope(Some(" XboxBvhBuilder.dll ,game_scarlett_master.exe,"));
+        assert!(in_f16_scope(&listed, Some("xboxbvhbuilder.dll"), P));
+        assert!(in_f16_scope(&listed, Some("game_scarlett_master.exe"), P));
+        assert!(!in_f16_scope(&listed, upscaler, P));
+        // A program by its hash, wherever it came from; others from its image not.
+        let one = f16_scope(Some("6A6C7B7FDE59134F"));
+        assert!(in_f16_scope(&one, upscaler, "6a6c7b7fde59134f"));
+        assert!(in_f16_scope(&one, None, "6a6c7b7fde59134f"));
+        assert!(!in_f16_scope(&one, upscaler, P));
+    }
+
+    #[test]
+    fn translations_in_the_console_f16_scope_are_cached_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        assert_eq!(scoped(build, false), build);
+        assert_ne!(scoped(build, true), build);
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        for console_f16 in [false, true, false, true] {
+            cached(&cache, &scoped(build, console_f16), container, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "one translation of each kind");
     }
 
     #[test]

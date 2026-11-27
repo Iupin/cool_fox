@@ -210,7 +210,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes, entry.file_name().to_str()) {
                                 Ok(true) => 0,
                                 Ok(false) => 1,
                                 Err(_) => 2,
@@ -423,7 +423,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                             if !lock(&seen).insert(hash) {
                                 continue;
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
+                            match victory_hle::modules::d3d12x::precompile(&bytes, entry.file_name().to_str()) {
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
