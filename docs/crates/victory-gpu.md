@@ -131,10 +131,10 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `host.rs` | 10258 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
 | `host/aside.rs` | 92 | C | Heap buffer-view pass on `victory-aside` |
 | `host/awake.rs` | 235 | C | `VICTORY_CARD_AWAKE`: keeps GPU clocks up |
-| `host/card_steps.rs` | 1278 | C/M | `VICTORY_CARD_STEPS` |
+| `host/card_steps.rs` | 1785 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
 | `host/indirects.rs` | 134 | D | What indirect executions ran, for device-removed reports |
 | `host/panel.rs` | 442 | D | On-screen numbers (`VICTORY_PANEL`, F3) |
-| `host/place.rs` | 307 | C/M | Buffer copies done on the card at their place |
+| `host/place.rs` | 328 | C/M | Buffer copies done on the card at their place |
 | `host/send.rs` | 306 | M | `VICTORY_SEND_OWN` sends |
 | `host/spans.rs` | 214 | D | GPU timestamps around submissions |
 | `host/stamps.rs` | 171 | D | Timestamps for the timeline |
@@ -587,7 +587,9 @@ switches that only work in diagnostics builds.
 | `VICTORY_CARD_AWAKE` | `host/awake.rs:66` | `1`: keep GPU clocks up (launcher sets) |
 | `VICTORY_CARD_SPANS` **D** | `host/spans.rs:69` | Card-side timestamps |
 | `VICTORY_PANEL` **D** | `host/panel.rs:39` | On-screen panel (F3) |
-| `VICTORY_PLACED_ORDER` | `host/card_steps.rs:103` | `1`: finer refusal for placed copies |
+| `VICTORY_PLACED_ORDER` | `host/card_steps.rs` `placed_order` | `1`: finer refusal for placed copies, and the cut |
+| `VICTORY_PLACED_FORWARD` | `host/card_steps.rs` `placed_forward` | on; `0`: a fill behind a placed copy of its bytes is refused (waits) instead of read through it |
+| `VICTORY_CARD_STEPS_CHECK` | `host/card_steps.rs` `check` | `1`: those fills compared with title memory after the landing |
 | `VICTORY_SEND_OWN` / `VICTORY_SEND_BAR` / `VICTORY_UNDER_WORDS` | `host/send.rs:27`, `135`, `60` | Memory half |
 | `VICTORY_UPCOPY_CHECK` / `VICTORY_CARD_ALL` / `VICTORY_FETCH_CHECK` | `host/upcheck.rs:33`, `954`; `host/torn.rs:35` | Memory-half checks |
 | `VICTORY_WAIT_ASK` | `list.rs:2007` | `1`: `VirtualQuery` before reading a waited value |
@@ -811,7 +813,7 @@ cargo test -p victory-gpu --release -- --ignored bare_command_cost --nocapture
 ```
 
 Ignored tests that "want a process of its own" (`host/upcheck.rs`,
-`host/card_steps.rs:1220`) read once-only switches, so run them one at a
+`host/card_steps.rs` `a_copy_behind_a_flight_reads_what_the_flight_wrote`) read once-only switches, so run them one at a
 time with the stated environment.
 
 ---

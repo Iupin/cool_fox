@@ -535,6 +535,30 @@ Card steps are refused, and the old wait taken, when:
 105 ms frame spent waiting for skinning passes that write through a view of the
 whole 174 MB heap.
 
+Copies at their place (`place.rs`, below) and card steps (2026-11-27):
+
+- A fill behind a copy at its place that reads only bytes the copy writes is
+  done on the card from the copy's source (`forward`,
+  `VICTORY_PLACED_FORWARD`, on). The title copies a few hundred bytes of
+  constants into its ring with a `CopyBufferRegion`, and a draw behind it in
+  the same list reads them as a constant buffer; the ring lies in the heap the
+  skinning passes declare written, so the fill is a card step, done in front
+  of the lists, before the copy. Every such submission was refused and waited
+  60-80 ms for the flights (all the refusals of the 2026-11-27 runs). Taken
+  only where it is what the CPU reads after the wait: nothing between copy and
+  fill writes the fill's bytes or the copy's source, no copy at its place
+  ahead of the fill writes the source, source and destination do not meet.
+  A copy at its place is in the way only of the card steps behind it.
+  `VICTORY_CARD_STEPS_CHECK=1` reads back what each such fill was given and
+  compares it with title memory after the landing.
+- Two holes closed: with card steps taken, the CPU's waits for a copy at its
+  place were skipped. A copy whose source is taken from title memory at
+  submission (no shader writes that memory) while a flight may write it, or
+  behind a card step that writes it, read it too early; a step left on the CPU
+  behind a copy that flights keep out of title memory read its destination
+  without the copy. Both are refused now (`PLACED_SOURCE`, `PLACED_READ`), as
+  the CPU's way waits for them (`Placed::waits`, `place::read_by`).
+
 `host/place.rs` (`VICTORY_COPIES_IN_PLACE`, on): the title's buffer copy runs in
 the destination's host copy at its list position. Its bytes count as a shader
 write from then on. Copies larger than 8 MiB out of memory that no shader writes
@@ -885,7 +909,9 @@ launcher sets, with the value it sets.
 | `VICTORY_RELAY_COPY` | host.rs:2505 | off; **L**=1 | Relay fetches go over a copy queue. |
 | `VICTORY_FETCH_CHECK` | host/torn.rs:35 | off | Hash fetched pieces to catch torn fetches. |
 | `VICTORY_CARD_STEPS` | host/card_steps.rs:79 | 0; **L**=2 | 1 fills, 2 fills and copies on the card (§3.7). |
-| `VICTORY_PLACED_ORDER` | host/card_steps.rs:103 | off | Cut a submission behind an in-place copy instead of refusing card steps. |
+| `VICTORY_PLACED_ORDER` | host/card_steps.rs `placed_order` | off | Cut a submission behind an in-place copy instead of refusing card steps. |
+| `VICTORY_PLACED_FORWARD` | host/card_steps.rs `placed_forward` | on | A fill behind an in-place copy that reads only its bytes is done on the card from the copy's source (§3.7); `0`: refused, the submission waits. |
+| `VICTORY_CARD_STEPS_CHECK` | host/card_steps.rs `check` | off | `1`: what those fills were given is read back and compared with title memory after the landing (a warning per frame line if any differ). |
 | `VICTORY_COPIES_IN_PLACE` | host/place.rs:43 | on | Title buffer copies on the card at their list position. |
 | `VICTORY_FILL_TITLE` | host.rs:2809 | off | An experiment named in the card-steps docs. |
 | `VICTORY_JOIN_COPIES` | host.rs:3773 | off; **L**=1 | Join adjacent title copies into one kernel copy. |
