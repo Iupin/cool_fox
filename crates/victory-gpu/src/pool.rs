@@ -16,11 +16,21 @@
 //! texture's piece comes back when the last reference to the host texture
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
+//!
+//! On a card whose budget is 12 GiB or less ([`compact`]) the blocks of
+//! textures are of 16 MiB, pieces are cut from the fullest block that has
+//! room, and the blocks come to at most a quarter of the budget and to what
+//! textures hold plus a sixteenth of it ([`cap_bytes`]): past that a texture
+//! gets an allocation of its own. A block is given back only when nothing is
+//! in it, and with 64 MiB blocks cut first-fit the world's load left them
+//! holding 4,672 to 4,800 MB for at most 1,775 MB of textures on an RTX 3080
+//! (budget 8,980 MB), which kept the card over its budget for good
+//! (`docs/findings.md`, 2026-11-27).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -28,6 +38,9 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+/// The same of textures on a card of 12 GiB or less ([`compact`]): a block
+/// that one texture still holds keeps a quarter as much.
+const SMALL_BLOCK: u64 = 16 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -42,10 +55,17 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    if let Some([budget, ..]) = memory
+        && budget > 0
+    {
+        BUDGET.store(budget, Ordering::Relaxed);
+    }
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let small = compact().then(budget);
+    let limit = spares(memory, crate::host::keep_freed() && !pressure, small);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    say(memory, tick);
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -63,11 +83,91 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
 }
 
-fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+/// `small`: the budget of a card of 12 GiB or less ([`compact`]), whose
+/// empty blocks kept come to a thirty-second of it (17 of 16 MiB on a budget
+/// of 8,980 MB, where 64 of 64 MiB were nearly half of it).
+fn spares(memory: Option<[u64; 4]>, keep: bool, small: Option<u64>) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => match small {
+            Some(small) => SPARE_KEPT.min((small / 32 / SMALL_BLOCK) as usize).max(SPARE),
+            None => SPARE_KEPT,
+        },
         _ => SPARE,
     }
+}
+
+/// Whether the card's budget is 12 GiB or less: its blocks of textures are
+/// then of [`SMALL_BLOCK`], cut fullest first and capped ([`cap_bytes`]);
+/// the room rule counts their free space up to [`slack_bytes`] only
+/// (`resource::room`) and keeps less for render targets once the world has
+/// made them (`resource::targets_room_kept`), and the sweep first lets go
+/// what gives memory back (`resource::let_go_idle`). Decided with the first
+/// budget known. `VICTORY_POOL_COMPACT=0`: never (as before, and as on
+/// larger cards); `=1`: whatever the budget.
+pub(crate) fn compact() -> bool {
+    // 0: not known yet, 1: no, 2: yes.
+    static ON: AtomicU8 = AtomicU8::new(0);
+    match ON.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let asked = std::env::var("VICTORY_POOL_COMPACT").ok();
+    let on = match asked.as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => match budget() {
+            0 => return false,
+            budget => budget <= 12 << 30,
+        },
+    };
+    if ON.compare_exchange(0, if on { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed).is_ok() && on {
+        tracing::info!(
+            budget_mb = budget() >> 20,
+            "textures in blocks of {} MiB cut fullest first, at most a quarter of the card's budget (VICTORY_POOL_COMPACT=0: as on larger cards)",
+            SMALL_BLOCK >> 20
+        );
+    }
+    on
+}
+
+/// The card's budget as last asked ([`room`]), or asked now; 0: unknown.
+fn budget() -> u64 {
+    match BUDGET.load(Ordering::Relaxed) {
+        0 => {
+            let budget = crate::host::host().and_then(|h| h.video_memory()).map_or(0, |[budget, ..]| budget);
+            BUDGET.store(budget, Ordering::Relaxed);
+            budget
+        }
+        budget => budget,
+    }
+}
+
+static BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of free texture blocks that count as room on a card of budget
+/// `budget` ([`compact`]): a sixteenth of it, at least four blocks. Free
+/// space past that is what the world's load left scattered: most textures
+/// the queue makes cannot use it (those with levels on demand take tiles
+/// of their own), and it is given back as the blocks empty, not filled.
+fn slack_bytes(budget: u64, block: u64) -> u64 {
+    (budget / 16).max(4 * block)
+}
+
+/// The most bytes of texture blocks on a card of budget `budget`
+/// ([`compact`]) while textures hold `held` bytes of them: a quarter of the
+/// budget, and not more than `held` and [`slack_bytes`]. A new block is
+/// made only under it. The quarter is what bounds the load's leftovers:
+/// the world's load fills the blocks to it and then lets two thirds of its
+/// textures go, and the pieces that stay are in use by slots, which the
+/// sweep cannot let go. At a third (2,880 MB of 8,647) the blocks stayed at
+/// 3,072 MB for 1,136 MB of textures, the card at 94 % and no texture was
+/// made for the rest of the launch; at a quarter they stayed 82 % full, the
+/// card at 89 %, and what went past the line (11,710 textures) had memory
+/// of its own and was given back exactly when it went.
+fn cap_bytes(budget: u64, held: u64, block: u64) -> u64 {
+    let slack = slack_bytes(budget, block);
+    (budget / 4).max(slack).min(held.saturating_add(slack))
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -127,45 +227,51 @@ impl Ripe {
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+/// The free ranges of a block: start and length, never two that touch; and
+/// their bytes.
+struct Ranges {
+    free: BTreeMap<u64, u64>,
+    bytes: u64,
+}
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges { free: BTreeMap::from([(0, size)]), bytes: size }
     }
 
     /// The lowest place for `len` bytes at a multiple of `align`.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
+        let (start, size, at) = self.free.iter().find_map(|(&start, &size)| {
             let at = start.next_multiple_of(align);
             (at + len <= start + size).then_some((start, size, at))
         })?;
-        self.0.remove(&start);
+        self.free.remove(&start);
         if at > start {
-            self.0.insert(start, at - start);
+            self.free.insert(start, at - start);
         }
         if at + len < start + size {
-            self.0.insert(at + len, start + size - at - len);
+            self.free.insert(at + len, start + size - at - len);
         }
+        self.bytes -= len;
         Some(at)
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
-        if let Some((&before, &size)) = self.0.range(..start).next_back()
+        self.bytes += len;
+        if let Some((&before, &size)) = self.free.range(..start).next_back()
             && before + size == start
         {
-            self.0.remove(&before);
+            self.free.remove(&before);
             (start, len) = (before, len + size);
         }
-        if let Some(size) = self.0.remove(&(start + len)) {
+        if let Some(size) = self.free.remove(&(start + len)) {
             len += size;
         }
-        self.0.insert(start, len);
+        self.free.insert(start, len);
     }
 
     fn whole(&self, size: u64) -> bool {
-        self.0.get(&0) == Some(&size)
+        self.free.get(&0) == Some(&size)
     }
 }
 
@@ -180,6 +286,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Bytes of the pieces taken and not given back.
+    held: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -199,11 +307,44 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// Bytes of a block.
+    block: u64,
+    /// Pieces are cut from the fullest block with room, not the first.
+    fullest: bool,
+    /// A new block is made only while all of them stay within this many
+    /// bytes ([`cap_bytes`]).
+    cap: u64,
+    /// Since the start: pieces not cut for that cap, blocks made, blocks
+    /// let go.
+    capped: u64,
+    made: u64,
+    gone: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            block: BLOCK,
+            fullest: false,
+            cap: u64::MAX,
+            capped: 0,
+            made: 0,
+            gone: 0,
+        }
+    }
+
+    /// Blocks of `block` bytes cut fullest first ([`compact`]), from before
+    /// the first block is made.
+    fn compact(&mut self, block: u64) {
+        if self.made == 0 {
+            self.block = block;
+            self.fullest = true;
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -224,18 +365,31 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block } else { self.block / 2 } {
             return None;
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if self.fullest {
+            // The fullest first: the emptiest get no new pieces while others
+            // have room, and go when their last piece goes.
+            let mut order: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.as_ref().filter(|b| ripe.is(b) && b.free.bytes >= len).map(|b| (b.free.bytes, i)))
+                .collect();
+            order.sort_unstable();
+            found = order.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -250,6 +404,10 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
+                if !self.under_cap() {
+                    self.capped += 1;
+                    return None;
+                }
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
@@ -262,17 +420,24 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block)).count();
             if empty < ripe.ahead
+                && self.under_cap()
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.held += len;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// Whether one more block stays within [`Pool::cap`].
+    fn under_cap(&self) -> bool {
+        (self.blocks() as u64 + 1).saturating_mul(self.block) <= self.cap
     }
 
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
@@ -294,11 +459,16 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(self.block), held: 0, used_to: 0, made, since: crate::host::now_ms() });
+        self.made += 1;
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(block) = self.blocks.get_mut(piece.block).and_then(Option::as_mut) {
+            block.held = block.held.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
     }
 
@@ -316,7 +486,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -324,11 +494,13 @@ impl<B: Clone> Pool<B> {
         let previous = std::mem::replace(&mut self.spare, most);
         if sweep || any || most < previous {
             let mut spare = 0;
+            let size = self.block;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.gone += 1;
                     }
                 }
             }
@@ -337,6 +509,21 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    /// Bytes of the blocks.
+    fn bytes(&self) -> u64 {
+        self.blocks() as u64 * self.block
+    }
+
+    /// Bytes of the pieces taken and not given back.
+    fn held(&self) -> u64 {
+        self.blocks.iter().flatten().map(|b| b.held).sum()
+    }
+
+    /// Whether the block of `piece` holds half of itself or less.
+    fn sparse(&self, piece: Piece) -> bool {
+        self.blocks.get(piece.block).and_then(Option::as_ref).is_some_and(|b| b.held * 2 <= self.block)
     }
 }
 
@@ -358,15 +545,86 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
+/// On a card of 12 GiB or less ([`compact`]) not more than [`slack_bytes`].
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    let pool = lock(&TEXTURES);
+    let free = pool.bytes().saturating_sub(HELD.load(Ordering::Relaxed));
+    if compact() { free.min(slack_bytes(budget(), pool.block)) } else { free }
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [lock(&TEXTURES).bytes() >> 20, lock(&STAGING).bytes() >> 20]
 }
+
+/// The pool's line (every 5 s, once a block was made): its blocks against
+/// what textures hold of them and against the card's budget, so that what
+/// lies free in it shows in any build.
+fn say(memory: Option<[u64; 4]>, now: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let (block, blocks, bytes, held, cap, capped, made, gone) = {
+        let Ok(pool) = TEXTURES.try_lock() else { return };
+        (pool.block, pool.blocks(), pool.bytes(), pool.held(), pool.cap, pool.capped, pool.made, pool.gone)
+    };
+    if made == 0 {
+        return;
+    }
+    let staging = STAGING.try_lock().map_or(0, |pool| pool.bytes());
+    let [budget, used] = memory.map_or([0, 0], |[budget, used, ..]| [budget, used]);
+    let mb = |bytes: u64| bytes >> 20;
+    let kinds = |i: usize| crate::resource::KINDS[i].load(Ordering::Relaxed);
+    tracing::info!(
+        "texture pool: {blocks} blocks of {} MiB, {} MB, of which textures hold {} MB and {} MB are free ({} MB of it counted as \
+         room); at most {} MB (0: no line); {capped} textures given memory of their own at that line, {made} blocks made and \
+         {gone} let go since the start; staging blocks {} MB; host copies the title fills: {} alive {} MB, {} let go {} MB and \
+         {} made again {} MB since the start, {} passes that made none for lack of room; the card: {} MB in use of a budget of \
+         {} MB ({:.1} %), room for textures: {}, kept for render targets {} MB and for card copies {} MB \
+         (VICTORY_POOL_COMPACT={})",
+        mb(block),
+        mb(bytes),
+        mb(held),
+        mb(bytes.saturating_sub(held)),
+        mb(texture_room()),
+        if cap == u64::MAX { 0 } else { mb(cap) },
+        mb(staging),
+        kinds(0),
+        mb(kinds(1)),
+        kinds(2),
+        mb(kinds(3)),
+        kinds(4),
+        mb(kinds(5)),
+        crate::draw::HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
+        mb(used),
+        mb(budget),
+        used as f64 * 100.0 / budget.max(1) as f64,
+        crate::resource::room(memory),
+        mb(crate::resource::targets_room_kept()),
+        mb(crate::shadow::card_room_kept()),
+        u8::from(compact())
+    );
+}
+
+/// Whether letting `texture` go gives memory back, on a card of 12 GiB or
+/// less ([`compact`]; else `None`): `None` too when it is not in a block;
+/// else whether its block holds half of itself or less. The sweep lets
+/// those go first (`resource::let_go_idle`).
+pub(crate) fn sparse(texture: &ID3D12Resource) -> Option<bool> {
+    if !compact() {
+        return None;
+    }
+    let piece = *lock(&PIECES).get(&(texture.as_raw() as usize))?;
+    Some(lock(&TEXTURES).sparse(piece))
+}
+
+/// The pieces of the textures alive in blocks, by the texture's address
+/// ([`compact`] only, for [`sparse`]).
+static PIECES: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Piece>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
 pub(crate) struct StagingPiece(Piece);
@@ -416,6 +674,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's address ([`PIECES`]).
+    texture: usize,
 }
 
 struct Methods([*const (); 3]);
@@ -453,6 +713,9 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            if compact() {
+                lock(&PIECES).remove(&gone.texture);
+            }
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -478,10 +741,34 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
+/// What a texture cut from a block holds ([`Reclaim`]).
+const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// Whether `texture` may lie where another did, so that its first upload
+/// needs an aliasing barrier (`texture::record_upload`): cut from a block,
+/// or reserved (its tiles come from heaps of ours). A texture with memory
+/// of its own takes none: the host refuses the list ("committed resource
+/// memory cannot be aliased"). Before the compact pool few such textures
+/// got there (those over 64 MiB); with it those over 16 MiB and those made
+/// at the pool's cap do.
+pub(crate) fn may_alias(texture: &ID3D12Resource) -> bool {
+    let mut size = 0u32;
+    // SAFETY: a size query of private data, and of heap properties (which
+    // a reserved resource has none of).
+    unsafe {
+        texture.GetPrivateData(&KEY, &mut size, None).is_ok() && size > 0
+            || texture.GetHeapProperties(None, None).is_err()
+    }
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let made = Box::into_raw(Box::new(Reclaim {
+        methods: &RECLAIM.0,
+        references: AtomicU32::new(1),
+        piece,
+        texture: texture.as_raw() as usize,
+    }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -521,10 +808,15 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let mut pool = lock(&TEXTURES);
+    if compact() {
+        pool.compact(SMALL_BLOCK);
+        pool.cap = cap_bytes(budget(), HELD.load(Ordering::Relaxed), pool.block);
+    }
+    let block = pool.block;
+    let taken = pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
+            SizeInBytes: block,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
@@ -542,7 +834,10 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap
-    })?;
+    });
+    drop(pool);
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = taken?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -550,12 +845,15 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
+            if compact() {
+                lock(&PIECES).insert(made.as_raw() as usize, piece);
+            }
             give_back_with(&made, piece);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
                 crate::book::made(&made, || "a texture in a block".into());
-                crate::book::block(&heap, &made, piece.start, BLOCK);
+                crate::book::block(&heap, &made, piece.start, block);
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
                     let (submission, since) = block.unwrap_or_default();
@@ -598,11 +896,260 @@ mod tests {
     }
 
     #[test]
+    fn ranges_count_their_free_bytes() {
+        let mut r = Ranges::new(1024);
+        assert_eq!(r.take(100, 64), Some(0));
+        assert_eq!(r.take(100, 64), Some(128));
+        // The 28 bytes between them are free still.
+        assert_eq!(r.bytes, 1024 - 200);
+        r.give(0, 100);
+        assert_eq!(r.bytes, 1024 - 100);
+        r.give(128, 100);
+        assert_eq!(r.bytes, 1024);
+        assert!(r.whole(1024));
+    }
+
+    #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
+        assert_eq!(spares(Some([100, 84, 0, 0]), true, None), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true, None), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false, None), SPARE);
+        assert_eq!(spares(None, true, None), SPARE);
+        // A card of 12 GiB or less keeps a thirty-second of its budget.
+        let budget = 8980 << 20;
+        assert_eq!(spares(Some([budget, budget / 2, 0, 0]), true, Some(budget)), 17);
+        assert_eq!(spares(Some([budget, budget, 0, 0]), true, Some(budget)), SPARE);
+        assert_eq!(spares(Some([budget, 0, 0, 0]), true, Some(1 << 30)), SPARE);
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_cap_follows_what_textures_hold_up_to_a_quarter_of_the_budget() {
+        let budget = 8980 << 20;
+        assert_eq!(slack_bytes(budget, SMALL_BLOCK), budget / 16);
+        assert_eq!(cap_bytes(budget, 0, SMALL_BLOCK), budget / 16);
+        assert_eq!(cap_bytes(budget, GIB, SMALL_BLOCK), GIB + budget / 16);
+        assert_eq!(cap_bytes(budget, 4 * GIB, SMALL_BLOCK), budget / 4);
+        // A small budget keeps four blocks of slack.
+        assert_eq!(cap_bytes(512 << 20, 0, SMALL_BLOCK), 4 * SMALL_BLOCK);
+    }
+
+    #[test]
+    fn larger_cards_keep_the_pool_as_it_was() {
+        let pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        assert_eq!((pool.block, pool.fullest, pool.cap), (BLOCK, false, u64::MAX));
+        // First fit, whatever is fuller.
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let a = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        let b = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        let c = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        assert_eq!((a.block, b.block, c.block), (0, 0, 1));
+        pool.give(a, 0);
+        pool.rested(REST);
+        assert_eq!(pool.take(65536, 65536, REST, make).unwrap().0.block, 0);
+    }
+
+    #[test]
+    fn pieces_come_from_the_fullest_block_with_room() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        pool.compact(SMALL_BLOCK);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let quarter = SMALL_BLOCK / 4;
+        let pieces: Vec<Piece> = (0..12).map(|_| pool.take(quarter, 65536, 0, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 3);
+        // Block 0 keeps one piece, block 1 three, block 2 two.
+        for &i in &[0, 1, 2, 4, 8, 9] {
+            pool.give(pieces[i], 0);
+        }
+        pool.rested(REST);
+        assert!(pool.sparse(pieces[3]) && !pool.sparse(pieces[5]) && pool.sparse(pieces[10]));
+        // The fullest with room is block 1, then block 2; block 0 last.
+        let got: Vec<usize> = (0..6).map(|_| pool.take(quarter, 65536, REST, make).unwrap().0.block).collect();
+        assert_eq!(got, [1, 2, 2, 0, 0, 0]);
+        assert_eq!(made.get(), 3);
+    }
+
+    #[test]
+    fn no_block_is_made_past_the_cap() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        pool.compact(SMALL_BLOCK);
+        pool.cap = 2 * SMALL_BLOCK;
+        let make = || Some(1);
+        let at = |started, finished| Ripe { started, finished, ahead: 2 };
+        // The first block, and one ahead: the cap.
+        assert!(pool.take_ripe(SMALL_BLOCK / 2, 65536, 0, at(0, 0), make).is_some());
+        assert_eq!(pool.blocks(), 2);
+        assert!(pool.take_ripe(SMALL_BLOCK / 2, 65536, 0, at(0, 0), make).is_some());
+        assert!(pool.take_ripe(SMALL_BLOCK, 65536, 0, at(0, 0), make).is_some());
+        assert!(pool.take_ripe(65536, 65536, 0, at(0, 0), make).is_none());
+        assert_eq!((pool.blocks(), pool.capped), (2, 1));
+        // No growth back-off for it: under a higher cap at once.
+        pool.cap = 3 * SMALL_BLOCK;
+        assert!(pool.take_ripe(65536, 65536, 0, at(0, 0), make).is_some());
+        assert_eq!(pool.blocks(), 3);
+    }
+
+    /// A world's load asks for 3 GB of textures of mixed sizes, of which a
+    /// third stay for good and the rest go; then textures come and go
+    /// around what is left, and once a "second" the sweep lets 64 idle ones
+    /// go that are made again at once (elsewhere) while the blocks hold more
+    /// than the textures and the slack: the sparsest first on a card of
+    /// 12 GiB or less (`resource::let_go_idle`), any before. The compact
+    /// pool never passes a quarter of the budget and comes back to what
+    /// textures hold and the slack; 64 MiB blocks cut first-fit keep all
+    /// the load made once two thirds of it went, as in the game (4,672 MB
+    /// of blocks for at most 1,775 MB of textures, `docs/findings.md`,
+    /// 2026-11-27).
+    #[test]
+    fn blocks_follow_what_textures_hold_through_churn() {
+        const BUDGET: u64 = 8980 << 20;
+        struct Sim {
+            pool: Pool<u32>,
+            /// Pieces, and whether they stay for good.
+            live: Vec<(Piece, bool)>,
+            seed: u64,
+            now: u64,
+            peak: u64,
+            own: u64,
+            compact: bool,
+        }
+        impl Sim {
+            fn next(&mut self, n: u64) -> u64 {
+                self.seed ^= self.seed << 13;
+                self.seed ^= self.seed >> 7;
+                self.seed ^= self.seed << 17;
+                self.seed % n
+            }
+
+            /// Small, middling and large (over half a small block: of their
+            /// own there).
+            fn size(&mut self) -> u64 {
+                match self.next(20) {
+                    0..=13 => (1 + self.next(64)) * 4096,
+                    14..=18 => (4 + self.next(28)) * 65536,
+                    _ => (32 + self.next(160)) * 65536,
+                }
+            }
+
+            fn add(&mut self, len: u64, stays: bool) {
+                self.now += 5;
+                if self.compact {
+                    self.pool.cap = cap_bytes(BUDGET, self.pool.held(), SMALL_BLOCK);
+                }
+                match self.pool.take(len, if len < 65536 { 4096 } else { 65536 }, self.now, || Some(0)) {
+                    Some((p, _, _)) => self.live.push((p, stays)),
+                    None => self.own += 1,
+                }
+                let bytes = self.pool.bytes();
+                assert!(!self.compact || bytes <= BUDGET / 4, "{} MB of blocks", bytes >> 20);
+                self.peak = self.peak.max(bytes);
+            }
+
+            fn remove(&mut self, i: usize) -> Piece {
+                self.now += 5;
+                let (piece, _) = self.live.swap_remove(i);
+                self.pool.give(piece, self.now);
+                piece
+            }
+
+            /// Lets up to 64 go and makes them again.
+            fn sweep(&mut self) {
+                let slack = slack_bytes(BUDGET, SMALL_BLOCK);
+                for _ in 0..64 {
+                    if self.pool.bytes() <= self.pool.held() + slack {
+                        return;
+                    }
+                    let i = if self.compact {
+                        let from = self.next(self.live.len() as u64) as usize;
+                        let n = self.live.len();
+                        match (0..n).map(|k| (from + k) % n).find(|&i| self.pool.sparse(self.live[i].0)) {
+                            Some(i) => i,
+                            None => return,
+                        }
+                    } else {
+                        self.next(self.live.len() as u64) as usize
+                    };
+                    let stays = self.live[i].1;
+                    let piece = self.remove(i);
+                    self.add(piece.len, stays);
+                }
+            }
+        }
+        // Blocks after the load, at the end, and what textures hold then.
+        let run = |compact: bool| {
+            let mut pool: Pool<u32> = Pool::new(SPARE);
+            if compact {
+                pool.compact(SMALL_BLOCK);
+            }
+            let mut s = Sim { pool, live: Vec::new(), seed: 0x2545_f491_4f6c_dd1d, now: 0, peak: 0, own: 0, compact };
+            let mut asked = 0;
+            while asked < 3 * GIB {
+                let len = s.size();
+                let stays = s.next(3) == 0;
+                s.add(len, stays);
+                asked += len;
+            }
+            let mut i = 0;
+            while i < s.live.len() {
+                if s.live[i].1 {
+                    i += 1;
+                } else {
+                    s.remove(i);
+                }
+            }
+            s.pool.rested(s.now + REST);
+            let after_load = s.pool.bytes();
+            let target = s.pool.held() + (256 << 20);
+            for step in 0..300_000u32 {
+                if s.pool.held() < target || s.next(2) == 0 && s.pool.held() < target + (64 << 20) {
+                    let len = s.size();
+                    s.add(len, false);
+                } else if !s.live.is_empty() {
+                    let i = s.next(s.live.len() as u64) as usize;
+                    if !s.live[i].1 {
+                        s.remove(i);
+                    }
+                }
+                if step % 200 == 0 {
+                    s.sweep();
+                }
+            }
+            s.pool.rested(s.now + REST);
+            (s.peak, after_load, s.pool.bytes(), s.pool.held(), s.own)
+        };
+        let mb = |b: u64| b >> 20;
+        let (old_peak, old_load, old_end, old_held, _) = run(false);
+        let (peak, load, end, held, own) = run(true);
+        println!(
+            "first fit, 64 MiB: peak {} MB, after the load {} MB, end {} MB for {} MB held",
+            mb(old_peak),
+            mb(old_load),
+            mb(old_end),
+            mb(old_held)
+        );
+        println!(
+            "fullest first, 16 MiB, capped: peak {} MB, after the load {} MB, end {} MB for {} MB held, {own} of their own",
+            mb(peak),
+            mb(load),
+            mb(end),
+            mb(held)
+        );
+        let slack = slack_bytes(BUDGET, SMALL_BLOCK);
+        assert!(peak <= BUDGET / 4);
+        assert!(end <= held + slack + SPARE as u64 * SMALL_BLOCK, "{} MB of blocks for {} MB", mb(end), mb(held));
+        // The old pool kept what the load made when two thirds of it went.
+        assert!(old_load > BUDGET / 3 && old_load > 2 * old_held, "{} MB after the load", mb(old_load));
+        assert!(old_end - old_held > end - held);
     }
 
     #[test]

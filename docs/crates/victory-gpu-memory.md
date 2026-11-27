@@ -723,12 +723,15 @@ a piece of a block.
 
 | Rule | Where |
 |---|---|
-| Pieces larger than half a block (larger than a block with ripe blocks) are not pooled | `take_ripe`, `pool.rs:227` |
+| **Compact pool** on cards whose DXGI budget is 12 GiB or less (`pool::compact`, decided with the first budget known; `VICTORY_POOL_COMPACT=0` never, `=1` always): texture blocks of 16 MiB (`SMALL_BLOCK`), pieces cut from the *fullest* ripe block with room (not the first), and a cap on the bytes of all blocks: a new block only while they stay within `cap_bytes` = min(budget/4, held + `slack_bytes`), slack = budget/16 (at least 4 blocks). Past the cap a texture gets an allocation of its own (as with the pool off), counted in the pool line. Empty blocks kept: budget/32 worth (17 of 16 MiB on 8,980 MB) instead of 64 of 64 MiB. Staging blocks are unchanged (64 MiB). Larger cards keep everything as it was. | `pool.rs` `compact`, `cap_bytes`, `slack_bytes`, `Pool::take_ripe`, `spares` |
+| The **pool line** (INFO, every 5 s, any build, both modes): blocks and their MB, MB textures hold, MB free and how much of it counts as room, the cap, textures given memory of their own at the cap, blocks made and let go, staging blocks, title-filled host copies alive / let go / made again, passes refused for room, the card's use against its budget, `room`, and both reserves. | `pool::say` |
+| Pieces larger than half a block (larger than a block with ripe blocks) are not pooled | `take_ripe` |
 | A piece given back rests `REST` = 2500 ms before reuse. The module comment says "two seconds", which is out of date. | `pool.rs:76,301` |
 | **Ripe blocks**: `VICTORY_RIPE_BLOCKS` (12) blocks are made ahead, and pieces are cut from blocks that every submission begun before their creation has finished. A device loss came from lists already on the card reading a new block's texture. | `pool.rs:87-125` |
 | Growth back-off: a failed block creation blocks growth for 500 ms. Existing free ranges are still used. | `Pool::grow`, `pool.rs:278` |
 | Spare empty blocks: 64 (`SPARE_KEPT`) while VRAM use is below 85% and `keep_freed` is on, else 2. Staging: 8; 1 under pressure; 0 under critical commit. | `pool::room`, `pool.rs:44-71` |
 | Speculative (picked, not bake) staging may grow a new block only with `residency::allow_staging_growth` | `pool.rs:389-395` |
+| The first upload of a texture puts an aliasing barrier on it only if it may lie where another did (`pool::may_alias`: cut from a block, or reserved). A texture with memory of its own gets none: the host refuses the list ("committed resource memory cannot be aliased"), which ended launches once the compact pool made such textures common. | `texture::record_upload`, `pool::may_alias` |
 | A reused staging piece is zeroed so unmapped levels upload zeros | `pool.rs:403-408` |
 
 ### 4.4 Uploads ahead on a copy queue (`texture/ahead.rs`)
@@ -789,9 +792,10 @@ The slot mechanics belong to the descriptor code; see
   - To check it is working, look for the info line
     `textures with levels on demand: N alive ...` (`tiles.rs`), or
     `VICTORY_CARD_ACCOUNTING=1` in a diagnostics build.
-  - Known gap: the pool does not hand back the blocks this empties. In the
-    same measurement the pool held 5,376 MB in blocks for about 2,200 MB of
-    pooled textures, so the card still read as nearly full.
+  - The pool did not hand back the blocks this emptied: in the same
+    measurement it held 5,376 MB in blocks for about 2,200 MB of pooled
+    textures, so the card still read as nearly full. On cards of 12 GiB or
+    less the compact pool (§4.3) bounds that since 2026-11-27.
 
 ### 4.7 Sparse (console tiled) memory
 
@@ -853,11 +857,12 @@ memory falls.
 
 | Knob | Rule |
 |---|---|
-| `resource::room` (`resource.rs:1676`) | New host copies of picked textures are always allowed up to `texture_floor_bytes` (2 GiB or budget/4). Beyond that, (VRAM used − free pool texture room + `card_room_kept` + `targets_room_kept`) must be below `room_percent` (90%) of the budget. `VICTORY_TEXTURE_BUDGET_MB` replaces the rule with a byte cap on title-filled copies. With no budget reported the limit is 4 GiB. |
-| `targets_room_kept` | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3072, at most 8192) minus the bytes of render targets and other host-written textures. |
+| `resource::room` | New host copies of picked textures are always allowed up to `texture_floor_bytes` (2 GiB or budget/4; budget/6 with the compact pool). Beyond that, (VRAM used − free pool texture room + `card_room_kept` + `targets_room_kept`) must be below `room_percent` (90%) of the budget. With the compact pool the free pool room counted is at most `pool::slack_bytes` (budget/16): free space beyond it is what the world's load left scattered, which textures with levels on demand cannot use at all. `VICTORY_TEXTURE_BUDGET_MB` replaces the rule with a byte cap on title-filled copies. With no budget reported the limit is 4 GiB. |
+| `targets_room_kept` | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3072, at most 8192) minus the bytes of render targets and other host-written textures. With the compact pool, once the world's first frames have made them (`note_targets`, once a second: they rose by 512 MiB within 20 s from a low of at least 64 MiB; logged once), at most `TARGETS_MARGIN` (512 MiB) is kept: on the RTX 3080 the targets were 1,360 MB and 1.7 GB had been kept for the rest of the session. |
+| `resource::let_go_idle` order | With a limit (`vram_keep`) and the compact pool, the sweep first lets go of idle copies whose going gives memory back (their own allocation, or a piece in a block holding half of itself or less: `pool::sparse`), longest idle first, then the others. The sweep's "used" figure uses the same capped pool room. |
 | `shadow::card_room_kept` | Room reserved for card copies not yet made: the `card_limits` cap, at most 1 GiB (`SEEN`), minus what was made or refused for VRAM room (`CARD_REFUSED`; copies refused by the cap or the small share give up nothing). Since 2026-11-26 the cap of a ≤ 12 GiB budget is above 1 GiB from about 7 GiB of budget, so 1 GiB is held back there (512 MiB before), the same as in the measured-fine run with `VICTORY_CARD_BUFFERS_MB=1280`. |
 | `card_room_for` | Card copies of buffers allowed up to 80% (or 97%) of the budget, plus the `card_limits` cap and, on ≤ 12 GiB budgets with the default cap, the small copies' share (§3.5, `card_admit`). |
-| `pool::room` | Spare blocks kept below 85% use. |
+| `pool::room` | Spare blocks kept below 85% use (budget/32 worth with the compact pool). Logs the pool line every 5 s. |
 | `host::video_memory` (`host.rs:9375`) | The DXGI budget and usage source, `[budget, used, ..]`. |
 
 Diagnostics: `VICTORY_CARD_ACCOUNTING=1` (`draw.rs:2432`, line text
@@ -1068,7 +1073,8 @@ launcher sets, with the value it sets.
 | `VICTORY_TEXTURE_SAME` | texture.rs:1620 | on | Skip re-uploads of byte-identical memory. |
 | `VICTORY_COMMITTED_QUERY` | texture.rs:1697 | off | Use `VirtualQuery` walks to ask whether memory is committed. |
 | `VICTORY_MAPPED_BY_VIEWS` / `_BY_PAGE` | texture.rs:1782,1792 | on / off | How mapped bytes are counted. |
-| `VICTORY_TEXTURE_POOL` | pool.rs:84 | on | Pooled 64 MiB blocks. |
+| `VICTORY_TEXTURE_POOL` | pool.rs `on` | on | Pooled blocks (64 MiB; 16 MiB with the compact pool). |
+| `VICTORY_POOL_COMPACT` | pool.rs `compact` | by the budget: on at 12 GiB or less | The compact pool and its room rules (§4.3, §5.2); `0` never, `1` always. |
 | `VICTORY_RIPE_BLOCKS` | pool.rs:101 | 12 | Blocks made ahead. |
 | `VICTORY_UPLOAD_AHEAD` | texture/ahead.rs:46 | off; **L**=1 | First uploads on our copy queue. |
 | `VICTORY_SHOW_AFTER` | descriptor/host.rs:292 | off (`!=0` turns it on); **L**=1 | Slots show a new texture after its upload. |
@@ -1082,7 +1088,7 @@ launcher sets, with the value it sets.
 |---|---|---|---|
 | `VICTORY_TEXTURE_BUDGET_MB` | resource.rs:1681 | unset | Byte cap instead of the VRAM percentage rule. |
 | `VICTORY_TEXTURE_ROOM_PERCENT` | resource.rs:1768 | 90 (50 to 97) | Share of the VRAM budget for picked-texture copies. |
-| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | resource.rs:1729 | 3072 | VRAM reserved for render targets. |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | resource.rs `targets_room_kept` | 3072 | VRAM reserved for render targets; with the compact pool at most 512 MiB once the world has made them. |
 | `VICTORY_TEXTURE_SWEEP` | resource.rs:2020,2070 | on; `whole` = whole table each look | Let idle host copies go. |
 | `VICTORY_TEXTURE_KEEP` | resource.rs:2037 | keep (any value except `0` or `1`) | `0` or `1` disables the budget-ordered keep and uses `vram_idle_ms`. It is odd that `1` also disables it. |
 | `VICTORY_CARD_ACCOUNTING` | draw.rs:2432 | off | The VRAM accounting line. |
@@ -1121,7 +1127,8 @@ launcher sets, with the value it sets.
 3. Flights land in order, and fences and bottom-of-pipe writes come after their
    flight's landing (§3.6).
 4. Pool pieces are never reused within 2500 ms or while a list names them.
-   Pieces come from ripe blocks.
+   Pieces come from ripe blocks. A block is let go only when wholly empty
+   (the compact pool changes which block a piece is cut from, never this).
 5. Objects let go are dropped only `bury_lag` submissions after the last one
    that may use them (`retire`, `bury`, `host.rs:462-519`).
 6. `ASKING` is taken before the journal lock and never under it. `merging` is
@@ -1227,7 +1234,7 @@ Do not run them while another build holds the target directory.
 | `shadow.rs` | 34 (1) | The touched list takes a changed card copy once (changed before and after registering, many times). Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |
 | `safecopy.rs` | 8 (1) | Every length and alignment. Only changed dwords are put. Faults become failures. |
-| `pool.rs` | 7 | Ranges, spares, growth back-off, rest, ripe blocks, reclaim. |
+| `pool.rs` | 13 | Ranges and their free bytes, spares (both modes), growth back-off, rest, ripe blocks, reclaim, the cap arithmetic, fullest-first placement, no block past the cap, larger cards unchanged, and a load-then-churn simulation (`blocks_follow_what_textures_hold_through_churn`) in which the compact pool stays under budget/4 and returns to held + slack while 64 MiB first-fit keeps what the load made. |
 | `residency.rs` | 3 | Reserves, pressure hysteresis, prefetch limits. |
 | `host/card_steps.rs` | 9 (1) | Planning and refusal rules, the order behind flights. |
 | `host/upcheck.rs` | 11 (10 ignored: GPU) | Undeclared writes, copy order. |

@@ -9,9 +9,9 @@ explained in a comment where it is read, and this page quotes that comment.
 
 | set | count | how |
 |---|---:|---|
-| distinct `VICTORY_*` names anywhere in tracked files | **361** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
-| distinct names in `.rs` files (code and comments) | 357 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
-| distinct names as a string literal `"VICTORY_..."` in `.rs` | 356 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
+| distinct `VICTORY_*` names anywhere in tracked files | **372** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
+| distinct names in `.rs` files (code and comments) | 367 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
+| distinct names as a string literal `"VICTORY_..."` in `.rs` | 366 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
 | **read by product code** (tables below) | **326** | literal outside test modules/files, not only a `.env()` set or `==` compare |
 | of those, build-time `env!` values (not user settings) | 3 | `VICTORY_TRANSLATOR`, `VICTORY_SHADER_SOURCE_HASH`, `VICTORY_SHADER_SWITCHES` |
 | of those, set by `victory` itself for its own child processes | 2 | `VICTORY_AUDIO_CAPTURE_OF`, `VICTORY_RELAUNCHED_FROM` |
@@ -21,18 +21,15 @@ explained in a comment where it is read, and this page quotes that comment.
 | set by a launcher | 28 | [Launcher summary](#what-the-launchers-set) |
 | other (non-`VICTORY_`) variables read | 7 (4 by product code) | [Other variables](#other-variables) |
 
-322 + 30 + 1 = 353 names in `.rs`; + 1 doc-only = 354. (The six
-`VICTORY_WRITERS*` names were added on 2026-11-26 without re-running the
-classification; `crates/victory-gpu/src/writers.rs` counts once it is
-tracked. `VICTORY_MEMORY_FAULT_MB`, added later that day, is not counted
-either, nor are `VICTORY_EARLY_DEPTH`, `VICTORY_DUMP_ONLY` and
-`VICTORY_DUMP_RAW`, added after it. The first three rows were recounted on
-2026-11-27, after `VICTORY_WATCHED_HEAP`, `VICTORY_ASK_REFUSED`,
-`VICTORY_CARD_TOUCHED` and `VICTORY_RELOOK_MS` were added; "read by product
-code" is the old count plus those four, not reclassified.
+The first three rows were recounted on 2026-11-27 when the day's branches
+were merged. "Read by product code" and the rows under it were not
+reclassified: they are the count of 2026-11-26 (322) plus
+`VICTORY_WATCHED_HEAP`, `VICTORY_ASK_REFUSED`, `VICTORY_CARD_TOUCHED` and
+`VICTORY_RELOOK_MS`. Added since and described in the tables below but not
+in those counts: the six `VICTORY_WRITERS*` names, `VICTORY_MEMORY_FAULT_MB`,
+`VICTORY_EARLY_DEPTH`, `VICTORY_DUMP_ONLY`, `VICTORY_DUMP_RAW`,
 `VICTORY_PLACED_FORWARD`, `VICTORY_CARD_STEPS_CHECK`, `VICTORY_HOLDER_INDEX`,
-`VICTORY_SLOTS_APART` and `VICTORY_STEPS_THREADS` were added later that day
-and are not counted in the rows above.)
+`VICTORY_SLOTS_APART`, `VICTORY_STEPS_THREADS` and `VICTORY_POOL_COMPACT`.
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -449,12 +446,13 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_SHADER_SAVE` | `crates/victory-gpu/src/pipeline.rs:154` | path; unset = off | `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as translated (`.dxil`), by the hash crash reports name it with | neither |
 | `VICTORY_SKIP_PIPELINES` | `crates/victory-gpu/src/pipeline.rs:518` | `<16-hex hash>,...`; anything else warned and ignored; diag build | Omit draws/dispatches whose pipeline contains a listed shader hash. | play.ps1=`none` |
 
-### victory-gpu / pool (2)
+### victory-gpu / pool (3)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
-| `VICTORY_RIPE_BLOCKS` | `crates/victory-gpu/src/pool.rs:101` | number; default `12` | How many blocks of textures are made ahead, so that one has been there for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12; 0: none, and new blocks are used at once, as before). | neither |
-| `VICTORY_TEXTURE_POOL` | `crates/victory-gpu/src/pool.rs:84` | true unless `0` | `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.  | neither |
+| `VICTORY_POOL_COMPACT` | `crates/victory-gpu/src/pool.rs` `compact` | `0` never, `1` always; default: on when the card's budget is 12 GiB or less | Blocks of textures of 16 MiB cut fullest first and capped at a quarter of the budget (and at what textures hold plus a sixteenth); the room rule counts their free space up to that sixteenth only and keeps less for render targets once the world has made them; the sweep first lets go what gives memory back. `VICTORY_POOL_COMPACT=0`: never (as before, and as on larger cards). | neither |
+| `VICTORY_RIPE_BLOCKS` | `crates/victory-gpu/src/pool.rs` `ahead` | number; default `12` | How many blocks of textures are made ahead, so that one has been there for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12; 0: none, and new blocks are used at once, as before). | neither |
+| `VICTORY_TEXTURE_POOL` | `crates/victory-gpu/src/pool.rs` `on` | true unless `0` | `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.  | neither |
 
 ### victory-gpu / popwatch (3)
 
@@ -493,7 +491,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
 | `VICTORY_ALIAS_COPY` | `crates/victory-gpu/src/resource.rs:1421`, `crates/victory-gpu/src/resource.rs:1427` | true unless `0` | `VICTORY_ALIAS_COPY=0`: none is found, as before; | neither |
-| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | `crates/victory-gpu/src/resource.rs:1729` | u64 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as before) less what such copies hold now. | neither |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | `crates/victory-gpu/src/resource.rs:1729` | u64 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as before) less what such copies hold now. With the compact pool (`VICTORY_POOL_COMPACT`), at most 512 MiB once the world's first frames have made them. | neither |
 | `VICTORY_DEPTH_TWINS` | `crates/victory-gpu/src/resource.rs:463`, `crates/victory-gpu/src/resource.rs:474`, `crates/victory-gpu/src/resource.rs:550` | true unless `0` | `VICTORY_DEPTH_TWINS=0` makes none (such views stay null), `VICTORY_DEPTH_TWINS=stencil` only those of formats with a stencil plane, `VICTORY_DEPTH_TWINS=nodepth` none for the depth planes of such formats. | neither |
 | `VICTORY_HELD_LEVELS` | `crates/victory-gpu/src/resource.rs:1243` | true unless `0` | Whether a texture the title places in memory is read, kept and uploaded from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole, as before). | neither |
 | `VICTORY_LAZY_TEXTURES` | `crates/victory-gpu/src/resource.rs:1487` | true unless `0` | `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture, as before. | neither |
