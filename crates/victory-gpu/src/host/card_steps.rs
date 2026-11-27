@@ -187,6 +187,121 @@ pub(super) struct Writer {
     copy: bool,
 }
 
+/// What writers write, by pieces of title memory: in each piece between two
+/// of their ends, whether a writer without a host copy writes it, and the
+/// host copies writers write it through (none, one, or several). [`holder`]
+/// looks there instead of at every writer: the flights in the air declare
+/// hundreds of ranges, and a frame's 5,000-7,500 fills are each looked up.
+/// (`VICTORY_HOLDER_INDEX=0`: every writer for every fill, as before.)
+#[derive(Default)]
+struct ByPiece {
+    /// The pieces' starts, in order; a piece ends where the next begins.
+    starts: Vec<usize>,
+    pieces: Vec<Piece>,
+    /// Writers of no bytes, which [`meet`] still finds inside a range.
+    empty: Vec<Writer>,
+}
+
+#[derive(Clone)]
+enum Piece {
+    Nobody,
+    /// Something without a host copy writes there.
+    Bare,
+    One(Arc<Shadow>),
+    Several,
+}
+
+fn holder_index() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HOLDER_INDEX") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLDER_INDEX").is_none_or(|v| v != "0"))
+}
+
+impl ByPiece {
+    fn new(writers: &[Writer]) -> ByPiece {
+        let mut ends: Vec<(usize, bool, usize)> = Vec::with_capacity(2 * writers.len());
+        let mut out = ByPiece::default();
+        for (k, w) in writers.iter().enumerate() {
+            if w.from < w.to {
+                ends.push((w.from, true, k));
+                ends.push((w.to, false, k));
+            } else {
+                out.empty.push(Writer { shadow: w.shadow.clone(), ..*w });
+            }
+        }
+        ends.sort_unstable_by_key(|e| e.0);
+        // Writers over the piece now: those without a host copy, and by host
+        // copy how many.
+        let mut bare = 0usize;
+        let mut by: HashMap<usize, (usize, Arc<Shadow>)> = HashMap::default();
+        let mut i = 0;
+        while i < ends.len() {
+            let at = ends[i].0;
+            while i < ends.len() && ends[i].0 == at {
+                let (_, opens, k) = ends[i];
+                match &writers[k].shadow {
+                    None if opens => bare += 1,
+                    None => bare -= 1,
+                    Some(s) => {
+                        let key = Arc::as_ptr(s) as usize;
+                        if opens {
+                            by.entry(key).or_insert_with(|| (0, s.clone())).0 += 1;
+                        } else if let Some(e) = by.get_mut(&key) {
+                            e.0 -= 1;
+                            if e.0 == 0 {
+                                by.remove(&key);
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let piece = match (bare, by.len()) {
+                (1.., _) => Piece::Bare,
+                (0, 0) => Piece::Nobody,
+                (0, 1) => Piece::One(by.values().next().map(|e| e.1.clone()).unwrap_or_else(|| unreachable!())),
+                _ => Piece::Several,
+            };
+            out.starts.push(at);
+            out.pieces.push(piece);
+        }
+        out
+    }
+
+    /// What [`holder`] finds of the writers of `[from, to)`: as there, the
+    /// host copy they all write it through if any.
+    fn of(&self, from: usize, to: usize) -> Result<Option<Arc<Shadow>>, &'static str> {
+        // The piece `from` lies in, and those after it up to `to`.
+        let first = self.starts.partition_point(|&s| s <= from).saturating_sub(1);
+        let mut found: Option<&Arc<Shadow>> = None;
+        for k in first..self.starts.len() {
+            let start = self.starts[k];
+            if start >= to {
+                break;
+            }
+            let end = self.starts.get(k + 1).copied().unwrap_or(usize::MAX);
+            if end <= from {
+                continue;
+            }
+            match (&self.pieces[k], found) {
+                (Piece::Nobody, _) => {}
+                (Piece::Bare, _) => return Err("a read-back or a value behind a flight is written there"),
+                (Piece::Several, _) => return Err("flights write it through two host copies"),
+                (Piece::One(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
+                (Piece::One(s), _) => found = Some(s),
+            }
+        }
+        let found = found.cloned();
+        written_through(&self.empty, None, from, to).and_then(|e| match (e, found) {
+            (Some(e), Some(f)) if !Arc::ptr_eq(&e, &f) => Err("flights write it through two host copies"),
+            (e, f) => Ok(f.or(e)),
+        })
+    }
+}
+
 /// What `items` of the line write.
 pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
     let mut out = Vec::new();
@@ -522,17 +637,33 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
+#[cfg(test)]
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-    let mut found: Option<&Arc<Shadow>> = None;
+    holder_of(written_through(writers, None, from, to)?, from, to)
+}
+
+/// The host copy all of `writers` that write `[from, to)` write it through,
+/// if any; with `index` ([`ByPiece`]) the writers it was made of are looked
+/// up there and `writers` are those added since.
+fn written_through(writers: &[Writer], index: Option<&ByPiece>, from: usize, to: usize) -> Result<Option<Arc<Shadow>>, &'static str> {
+    let mut found: Option<Arc<Shadow>> = match index {
+        Some(index) => index.of(from, to)?,
+        None => None,
+    };
     for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-        match (&w.shadow, found) {
+        match (&w.shadow, &found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
-            (Some(s), _) => found = Some(s),
+            (Some(s), _) => found = Some(s.clone()),
         }
     }
+    Ok(found)
+}
+
+/// [`holder`], given what [`written_through`] found.
+fn holder_of(found: Option<Arc<Shadow>>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let shadow = match found {
-        Some(s) => s.clone(),
+        Some(s) => s,
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
@@ -865,6 +996,9 @@ impl Host {
             }));
             all
         };
+        // (Looked up by piece; the copies' destinations added below one by one.)
+        let index = holder_index().then(|| ByPiece::new(&writers));
+        let base = if index.is_some() { writers.len() } else { 0 };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -887,7 +1021,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder_of(written_through(&writers[base..], index.as_ref(), src, src + len)?, src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -910,7 +1044,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = holder_of(written_through(&writers[base..], index.as_ref(), dst, dst + len)?, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -1594,6 +1728,55 @@ mod tests {
         assert!(!elsewhere(&does, 7, 100, 200));
         assert!(elsewhere(&does, 8, 199, 300));
         assert!(!elsewhere(&does, 8, 200, 300));
+    }
+
+    /// Looked up by piece, the writers of a range say what they say looked
+    /// at one by one, with writers added after the pieces were made too.
+    #[test]
+    fn writers_by_piece_say_what_writers_say() {
+        let mut memory = vec![0u8; 64];
+        let copies: Vec<Arc<Shadow>> = (0..3).map(|k| Shadow::unbacked(k * 64, memory.as_mut_ptr(), 64, false)).collect();
+        let mut seed = 4242u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut ok, mut err) = (0, 0);
+        for _ in 0..3000 {
+            let writers: Vec<Writer> = (0..random(12))
+                .map(|_| {
+                    let from = random(200) as usize;
+                    let to = from + random(40) as usize;
+                    let shadow = match random(7) {
+                        0 => None,
+                        k => Some(copies[k as usize % 3].clone()),
+                    };
+                    Writer { shadow, from, to, copy: false }
+                })
+                .collect();
+            let cut = random(writers.len() as u32 + 1) as usize;
+            let index = ByPiece::new(&writers[..cut]);
+            for _ in 0..20 {
+                let from = random(220) as usize;
+                let to = from + 1 + random(30) as usize;
+                let one = written_through(&writers, None, from, to);
+                let two = written_through(&writers[cut..], Some(&index), from, to);
+                match (&one, &two) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.as_ref().map(Arc::as_ptr), b.as_ref().map(Arc::as_ptr));
+                        ok += 1;
+                    }
+                    (Err(_), Err(_)) => err += 1,
+                    _ => panic!(
+                        "{from}..{to}: {:?} {:?} ({cut} indexed): {:?}",
+                        one.map(|s| s.map(|s| Arc::as_ptr(&s))),
+                        two.map(|s| s.map(|s| Arc::as_ptr(&s))),
+                        writers.iter().map(|w| (w.from, w.to, w.shadow.as_ref().map(Arc::as_ptr))).collect::<Vec<_>>()
+                    ),
+                }
+            }
+        }
+        assert!(ok > 10_000 && err > 5_000, "{ok} {err}");
     }
 
     /// A value written behind a flight, or a read-back, is in no host copy

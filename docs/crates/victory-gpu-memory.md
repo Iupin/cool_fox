@@ -558,6 +558,12 @@ Copies at their place (`place.rs`, below) and card steps (2026-11-27):
   behind a copy that flights keep out of title memory read its destination
   without the copy. Both are refused now (`PLACED_SOURCE`, `PLACED_READ`), as
   the CPU's way waits for them (`Placed::waits`, `place::read_by`).
+- Planning them costs the submitting thread some 7 ms a frame for the
+  5,000-8,000 fills of the ring (the timeline of run f1Diag1, four frames:
+  the slots 5.4 ms a frame, choosing 2.9, the list 2.5, what holds their
+  bytes 1.5). What holds each fill's bytes is looked up by pieces of memory
+  (`ByPiece`, `VICTORY_HOLDER_INDEX`, on) instead of over every range the
+  flights declared.
 
 `host/place.rs` (`VICTORY_COPIES_IN_PLACE`, on): the title's buffer copy runs in
 the destination's host copy at its list position. Its bytes count as a shader
@@ -912,6 +918,7 @@ launcher sets, with the value it sets.
 | `VICTORY_PLACED_ORDER` | host/card_steps.rs `placed_order` | off | Cut a submission behind an in-place copy instead of refusing card steps. |
 | `VICTORY_PLACED_FORWARD` | host/card_steps.rs `placed_forward` | on | A fill behind an in-place copy that reads only its bytes is done on the card from the copy's source (§3.7); `0`: refused, the submission waits. |
 | `VICTORY_CARD_STEPS_CHECK` | host/card_steps.rs `check` | off | `1`: what those fills were given is read back and compared with title memory after the landing (a warning per frame line if any differ). |
+| `VICTORY_HOLDER_INDEX` | host/card_steps.rs `holder_index` | on | What holds a card step's bytes is looked up by pieces of memory; `0`: over every declared range, per fill. |
 | `VICTORY_COPIES_IN_PLACE` | host/place.rs:43 | on | Title buffer copies on the card at their list position. |
 | `VICTORY_FILL_TITLE` | host.rs:2809 | off | An experiment named in the card-steps docs. |
 | `VICTORY_JOIN_COPIES` | host.rs:3773 | off; **L**=1 | Join adjacent title copies into one kernel copy. |

@@ -131,7 +131,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `host.rs` | 10258 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
 | `host/aside.rs` | 92 | C | Heap buffer-view pass on `victory-aside` |
 | `host/awake.rs` | 235 | C | `VICTORY_CARD_AWAKE`: keeps GPU clocks up |
-| `host/card_steps.rs` | 1785 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
+| `host/card_steps.rs` | 1781 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
 | `host/indirects.rs` | 134 | D | What indirect executions ran, for device-removed reports |
 | `host/panel.rs` | 442 | D | On-screen numbers (`VICTORY_PANEL`, F3) |
 | `host/place.rs` | 328 | C/M | Buffer copies done on the card at their place |
