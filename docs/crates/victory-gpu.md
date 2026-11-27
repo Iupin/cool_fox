@@ -128,7 +128,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `pipeline/library.rs` | 877 | C | `ID3D12PipelineLibrary` on disk, early/used/slow lists |
 | `pipeline/known.rs` | 456 | C | `VICTORY_PIPELINE_BOOK`, `victory warm` |
 | `shader_cache.rs` | 413 | C | Translated shaders on disk, keyed by translator hash + settings |
-| `host.rs` | 10735 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
+| `host.rs` | 10726 | C/M | Host device/queue/fence, `HostList`, `Host::submit`, late/relay line, present/swap chain, window, retire/sweep |
 | `host/aside.rs` | 92 | C | Heap buffer-view pass on `victory-aside` |
 | `host/awake.rs` | 235 | C | `VICTORY_CARD_AWAKE`: keeps GPU clocks up |
 | `host/card_steps.rs` | 2041 | C/M | `VICTORY_CARD_STEPS`; fills read through a copy at its place (`VICTORY_PLACED_FORWARD`) |
@@ -154,7 +154,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `book.rs` | 699 | D | Who owns which card memory (`VICTORY_BOOK`) |
 | `timeline.rs` + `timeline/{hooks,record,report}.rs` | 51+304+621+914 | C/D | `span()` (no-op without diagnostics), Chrome trace (`VICTORY_TIMELINE`) |
 | `shadow.rs` | 5307 | M | Host copies of title buffers |
-| `watch.rs` | 5006 | M | Write watching / guards |
+| `watch.rs` | 4946 | M | Write watching / guards |
 | `watched.rs` | 160 | M | Write-watched reservations for big blocks of host memory handed to the title (the title's allocator, device heaps; `VICTORY_WATCHED_HEAP`, [memory doc §3.3](victory-gpu-memory.md)) |
 | `writers.rs` | 2215 | M | The writers watch: which code writes a range of title memory, and what (`VICTORY_WRITERS*`, read in diagnostics builds; [memory doc §3.4a](victory-gpu-memory.md)) |
 | `resource.rs` | 4390 | M | Heaps, resources, host textures (`HostTexture`, `host_transition`) |

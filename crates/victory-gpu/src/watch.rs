@@ -664,8 +664,6 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    #[cfg(feature = "diagnostics")]
-    let mut alone = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
@@ -676,12 +674,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         {
             written.extend(pages);
             ahead.push((first, last));
-            #[cfg(feature = "diagnostics")]
-            alone.push(first * PAGE);
         }
     }
-    #[cfg(feature = "diagnostics")]
-    lone_reservations(&alone);
     note_hot(&written);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
@@ -695,71 +689,6 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
-}
-
-/// Diagnostics: since the last frame line, the ranges [`ask_rest`] asked
-/// about alone, the reservations they lie in (summed over submissions),
-/// those of them of less than 64 MiB, and those holding two or more of a
-/// submission's such ranges: whether asking per reservation would save calls.
-#[cfg(feature = "diagnostics")]
-static LONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-#[cfg(feature = "diagnostics")]
-fn lone_reservations(alone: &[usize]) {
-    use std::sync::atomic::Ordering::Relaxed;
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
-    if alone.is_empty() {
-        return;
-    }
-    let mut bases: BTreeMap<usize, (u32, usize)> = BTreeMap::new();
-    for &at in alone {
-        // SAFETY: plain data filled in by the query.
-        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
-            continue;
-        }
-        let base = m.AllocationBase as usize;
-        let e = bases.entry(base).or_insert((0, 0));
-        e.0 += 1;
-        if e.1 == 0 {
-            e.1 = *LONE_EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).entry(base).or_insert_with(|| {
-                // The reservation's extent: its regions from its base on, at
-                // most 64 of them (the title's own reservations have
-                // thousands: walking them whole stood 400 ms a frame).
-                let mut end = base;
-                for _ in 0..64 {
-                    // SAFETY: as above.
-                    let mut r: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-                    // SAFETY: as above.
-                    if unsafe { VirtualQuery(end as *const _, &mut r, size_of_val(&r)) } == 0 || r.AllocationBase as usize != base {
-                        return end - base;
-                    }
-                    end = r.BaseAddress as usize + r.RegionSize;
-                    if end - base >= 64 << 20 {
-                        break;
-                    }
-                }
-                usize::MAX
-            });
-        }
-    }
-    LONE[0].fetch_add(alone.len() as u64, Relaxed);
-    LONE[1].fetch_add(bases.len() as u64, Relaxed);
-    LONE[2].fetch_add(bases.values().filter(|e| e.1 < 64 << 20).count() as u64, Relaxed);
-    LONE[3].fetch_add(bases.values().filter(|e| e.0 >= 2).count() as u64, Relaxed);
-}
-
-/// The extents of the reservations [`lone_reservations`] found, until the
-/// next frame line (`usize::MAX`: 64 MiB or more, or too many regions).
-#[cfg(feature = "diagnostics")]
-static LONE_EXTENTS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
-
-/// [`LONE`], taken.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn lone_asks() -> [u64; 4] {
-    LONE_EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    [0, 1, 2, 3].map(|i| LONE[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,

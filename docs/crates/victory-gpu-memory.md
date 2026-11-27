@@ -237,12 +237,7 @@ guard or makes the copy fail cleanly. It replaced roughly 35,000
 Kernel-call batching: `ask_ahead` / `ask_once` (`watch.rs:315,530`) ask once
 for all of a submission's ranges that lie within 8 MiB of each other. With
 `VICTORY_ASK_EARLY`, the thread `victory-ask-early` asks hot pieces in advance
-while the title records. A range that lies more than 8 MiB from any other is
-asked about alone (`ask_rest`), about 200 a frame at some 30 µs each; the
-diagnostics line `ranges a submission's one asking asked alone per frame`
-says how many reservations they lie in, how many of those are under 64 MiB
-(each block of `watched.rs` is a reservation of its own) and how many hold
-two or more of them: what asking per reservation could save.
+while the title records.
 
 Refusals remembered (2026-11-27, `VICTORY_ASK_REFUSED`, on): a call the
 kernel refuses (the range is not write-watched memory of one reservation)
