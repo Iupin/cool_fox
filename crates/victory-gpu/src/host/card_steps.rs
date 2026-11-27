@@ -819,8 +819,9 @@ struct Op {
     level: u32,
     to: To,
     /// A fill read through a copy at its place ([`forward`]): the title
-    /// address it read before.
-    forwarded: Option<usize>,
+    /// address it read before, and (with [`check`]) whether a step behind it
+    /// in the submission writes those bytes again.
+    forwarded: Option<(usize, bool)>,
 }
 
 enum To {
@@ -1085,7 +1086,17 @@ impl Host {
                     None => continue,
                 },
             };
-            let forwarded = forwarded.binary_search_by_key(&i, |f| f.0).ok().map(|k| forwarded[k].1);
+            let forwarded = forwarded.binary_search_by_key(&i, |f| f.0).ok().map(|k| {
+                let at = forwarded[k].1;
+                // (Then title memory there after the landing is a later step's.)
+                let again = check()
+                    && does[i + 1..].iter().any(|d| match *d {
+                        Does::Copy { dst, len: n, .. } | Does::Placed { dst, len: n, .. } => meet((dst, dst + n), (at, at + len)),
+                        Does::Run => true,
+                        _ => false,
+                    });
+                (at, again)
+            });
             ops.push(Op {
                 from: (from, src),
                 len,
@@ -1211,7 +1222,9 @@ impl Host {
     /// has landed. `own`'s list is open, its levels recorded (the buffer
     /// between left readable by copies).
     fn check_forwarded(&self, own: &Own, ops: &[Op]) -> Option<Check> {
-        let looked: Vec<&Op> = ops.iter().filter(|op| op.forwarded.is_some()).collect();
+        let again = ops.iter().filter(|op| op.forwarded.is_some_and(|f| f.1)).count() as u64;
+        CHECKED.lock().unwrap_or_else(|e| e.into_inner()).3 += again;
+        let looked: Vec<&Op> = ops.iter().filter(|op| op.forwarded.is_some_and(|f| !f.1)).collect();
         let total: u64 = looked.iter().map(|op| op.len as u64).sum();
         if looked.is_empty() {
             return None;
@@ -1223,7 +1236,7 @@ impl Host {
             // SAFETY: an open list; live buffers, ranges inside them; the
             // buffer between is in a state copies read from.
             unsafe { own.list.list.CopyBufferRegion(&buffer, at, &own.between, op.at, op.len as u64) };
-            places.push((at as usize, op.forwarded.unwrap_or(0), op.len, op.from.1));
+            places.push((at as usize, op.forwarded.map_or(0, |f| f.0), op.len, op.from.1));
             at += op.len as u64;
         }
         Some(Check { buffer, places })
@@ -1239,8 +1252,9 @@ struct Check {
 }
 
 /// [`check`] since the last frame-rate line: fills compared, those that
-/// differed, and the last that did (title address, source, bytes).
-static CHECKED: Mutex<(u64, u64, Option<(usize, usize, usize)>)> = Mutex::new((0, 0, None));
+/// differed, the last that did (title address, source, bytes), and those not
+/// compared because a later step of their submission writes their bytes.
+static CHECKED: Mutex<(u64, u64, Option<(usize, usize, usize)>, u64)> = Mutex::new((0, 0, None, 0));
 
 impl Check {
     /// The submission has landed: title memory holds what the card made of
@@ -1367,14 +1381,14 @@ pub(super) fn log(frames: f64) {
         u8::from(placed_forward()),
     );
     if check() {
-        let (n, wrong, last) = std::mem::take(&mut *CHECKED.lock().unwrap_or_else(|e| e.into_inner()));
+        let (n, wrong, last, again) = std::mem::take(&mut *CHECKED.lock().unwrap_or_else(|e| e.into_inner()));
         let last = last.map_or_else(String::new, |(title, source, len)| {
             format!(" (the last: {len:#x} bytes at {title:#x}, read through {source:#x})")
         });
         if wrong > 0 {
-            tracing::warn!("card steps check (VICTORY_CARD_STEPS_CHECK): {wrong} of {n} fills read through a copy at its place differ from title memory after the landing{last}");
+            tracing::warn!("card steps check (VICTORY_CARD_STEPS_CHECK): {wrong} of {n} fills read through a copy at its place differ from title memory after the landing{last}; {again} not compared, written again later in their submission");
         } else {
-            tracing::info!("card steps check (VICTORY_CARD_STEPS_CHECK): {n} fills read through a copy at its place, all as title memory after the landing");
+            tracing::info!("card steps check (VICTORY_CARD_STEPS_CHECK): {n} fills read through a copy at its place, all as title memory after the landing; {again} not compared, written again later in their submission");
         }
     }
     #[cfg(feature = "diagnostics")]
