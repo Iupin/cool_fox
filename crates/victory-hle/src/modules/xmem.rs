@@ -249,7 +249,7 @@ pub extern "system" fn XMemVirtualQuery(
 const ALIGNMENT_SHIFT: u64 = 24;
 const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
-/// pointer handed out.
+/// pointer handed out; alignment 0 for a block of `victory_gpu::watched`.
 const HEADER: usize = 2 * size_of::<usize>();
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
@@ -330,6 +330,17 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // Big blocks are write-watched (`victory_gpu::watched`): a host copy of
+    // a buffer there copies only what was written since it last took it,
+    // not the whole buffer at every refresh. The header's alignment is 0.
+    if victory_gpu::watched::wanted(size)
+        && let Some(user) = victory_gpu::watched::alloc(size, layout.align())
+    {
+        // SAFETY: the page below the block is committed and the caller's
+        // but for its first word.
+        unsafe { user.as_ptr().sub(HEADER).cast::<[usize; 2]>().write([size, 0]) };
+        return user.as_ptr().cast();
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -365,6 +376,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align == 0 {
+            victory_gpu::watched::free(user);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

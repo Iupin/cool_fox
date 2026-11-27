@@ -196,6 +196,25 @@ deferred refresh:
 4. **Slow path**: memory that is neither watched nor guarded is marked
    `NOT_WATCHED` and copied whole at every refresh (`shadow.rs:3955-3964`).
 
+Host memory handed to the title (2026-11-27, `watched.rs`,
+`VICTORY_WATCHED_HEAP`, on): blocks of 64 KiB or more that the title's
+general allocator takes from the host (`XMemAllocDefault` in victory-hle,
+which the title's own allocation hooks fall back on) and the heaps the title
+makes through the device (`resource::Memory::new`) are reservations of their
+own made with `MEM_WRITE_WATCH`, so a host copy of a buffer there takes the
+fast path above instead of the slow one. Before, such memory came from the
+process heap: the title's upscaler scratch buffer (21,045,760 bytes, at a
+host address above 2^40) was copied whole twice a frame and sent up whole to
+its card copy every frame. Layout: whole 64 KiB of reservation around the
+caller's bytes, so an asking about their 64 KiB pages never reaches into the
+next reservation (which the kernel refuses); one committed 4 KiB page below
+them, whose first word holds the reservation's base for `watched::free`
+(victory-hle's block header, `[size, 0]`, lies just below the pointer). The
+kernel counts every writer: the title, the kernel's own writes (a `ReadFile`
+into the block, tested) and our landings, which are then compared by the next
+refresh (`VICTORY_LAND_ECHO`) and not sent up again. Smaller blocks stay on
+the process heap.
+
 Copies of title memory use `safecopy::copy` (`safecopy.rs`). It is one
 `rep movsb`. A fault inside it is caught by the same vectored handler
 (`safecopy::failing_exit`, `watch.rs:2573`), which either opens a block we
@@ -880,6 +899,7 @@ launcher sets, with the value it sets.
 | `VICTORY_KNOWN_HOLES` | watch.rs:1070 | on (with light refresh) | Cache placeholder holes until the runtime reports a change. |
 | `VICTORY_LIGHT_REFRESH` | watch.rs:826 | on | Answer guarded ranges from bits, without the guard lock. |
 | `VICTORY_PAGE_PARTS` | watch.rs:54 | on | Track 4 KiB parts. |
+| `VICTORY_WATCHED_HEAP` | watched.rs `on` | on | Blocks of 64 KiB or more of host memory handed to the title (its allocator's, device heaps) are write-watched reservations (§3.3); `0`: the process heap, copied whole at every refresh. |
 | `VICTORY_TAKE_PARTS` | watch.rs:787 | on | Re-take only the parts written. |
 | `VICTORY_ASK_ONCE` | watch.rs:524 | on | One write-watch asking per submission. |
 | `VICTORY_ASK_EARLY` | watch.rs:403 | unset = off; a value = every N ms (2 if it does not parse) | Asks while the title records. |

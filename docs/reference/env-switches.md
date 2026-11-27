@@ -595,6 +595,12 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_TAKE_PARTS` | `crates/victory-gpu/src/watch.rs:787` | default ON; `0` off | Of a page taken before, the parts written since, where they are known (`VICTORY_TAKE_PARTS=0`: the page). | neither |
 | `VICTORY_VIEW_GUARD` | `crates/victory-gpu/src/watch.rs:1809` | true unless `0` | Whether all the views of a guarded page are guarded together (`VICTORY_VIEW_GUARD`). | neither |
 
+### victory-gpu / watched (1)
+
+| name | where read | values & default | effect (from the read-site comment) | launcher |
+|---|---|---|---|---|
+| `VICTORY_WATCHED_HEAP` | `crates/victory-gpu/src/watched.rs` `on` | true unless `0` | Whether big blocks (64 KiB or more) of host memory for the title (`XMemAllocDefault`, device heaps) are write-watched reservations (`VICTORY_WATCHED_HEAP=0`: they come from the process heap, as before 2026-11-27, and host copies of buffers there are copied whole at every refresh). | neither |
+
 ### victory-gpu / writers (6)
 
 The writers watch (`docs/crates/victory-gpu-memory.md` §3.4a). Read once, by

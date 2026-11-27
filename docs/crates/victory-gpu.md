@@ -155,6 +155,7 @@ D = diagnostics only (`cfg(feature="diagnostics")`).
 | `timeline.rs` + `timeline/{hooks,record,report}.rs` | 51+304+621+914 | C/D | `span()` (no-op without diagnostics), Chrome trace (`VICTORY_TIMELINE`) |
 | `shadow.rs` | 5307 | M | Host copies of title buffers |
 | `watch.rs` | 4604 | M | Write watching / guards |
+| `watched.rs` | 160 | M | Write-watched reservations for big blocks of host memory handed to the title (the title's allocator, device heaps; `VICTORY_WATCHED_HEAP`, [memory doc §3.3](victory-gpu-memory.md)) |
 | `writers.rs` | 2215 | M | The writers watch: which code writes a range of title memory, and what (`VICTORY_WRITERS*`, read in diagnostics builds; [memory doc §3.4a](victory-gpu-memory.md)) |
 | `resource.rs` | 4390 | M | Heaps, resources, host textures (`HostTexture`, `host_transition`) |
 | `texture.rs`, `texture/ahead.rs` | 2205+445 | M | Texture detiling and uploads, copy queue |
