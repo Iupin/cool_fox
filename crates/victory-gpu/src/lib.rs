@@ -92,6 +92,8 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+pub mod watched;
+#[cfg(windows)]
 mod writers;
 #[cfg(windows)]
 mod texback;

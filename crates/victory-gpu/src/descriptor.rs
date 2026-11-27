@@ -658,6 +658,29 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// [`constant_slot`] for many slots of one heap, all views of `buffer`
+/// (slot, address, bytes): the heap looked for once, and what the slots
+/// held before retired together.
+pub(crate) fn constant_slots(
+    heap: usize,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    slots: impl Iterator<Item = (u32, u64, u32)>,
+) {
+    let mut let_go = Vec::new();
+    {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            for (index, gpu, size) in slots {
+                host.constant_at_into(index, buffer, gpu, size, &mut let_go);
+            }
+        }
+    }
+    crate::host::retire_resources(let_go);
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

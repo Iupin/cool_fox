@@ -59,6 +59,8 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        let newest = self.chunks.entry(page / CHUNK).or_insert(0);
+        *newest = (*newest).max(now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -125,6 +127,9 @@ struct Journal {
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Of each run of [`CHUNK`] pages (by page / `CHUNK`), the newest asking
+    /// in `written` there ([`nothing_new`]).
+    chunks: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -145,6 +150,7 @@ struct Journal {
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -192,7 +198,7 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    format!("ranges held {}, journal read {}, journal noted in {}, guards {}; the guards held by: {}", of(0), of(1), of(2), of(3), held::holders(frames))
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -242,12 +248,115 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Who asks the kernel ([`kernel_written`]), for the diagnostics' counts of
+/// refusals: a run of a submission's ranges ([`ask_run`]), a range of it that
+/// lies alone ([`ask_rest`]), a refresh's own asking ([`writes`]).
+#[derive(Clone, Copy)]
+enum Site {
+    Run = 0,
+    Rest = 1,
+    Range = 2,
+}
+
+/// Whether a range the kernel refused to answer for is not asked about again
+/// until the address space changes (`VICTORY_ASK_REFUSED=0`: every time, as
+/// before 2026-11-27).
+///
+/// A refusal costs a kernel call as an answer does (some 25 µs in the world,
+/// 60-100 µs under load: the call's own cost, whatever the range), and two in
+/// three of a frame's 540 askings were refused (run baseDiag1, gameplay: 357):
+/// the same ranges every frame, view memory that is guarded instead, runs of a
+/// submission's ranges that reach across two reservations (then asked by
+/// halves, [`ask_run`]), memory that is not write-watched at all.
+///
+/// Why leaving them unasked loses nothing: what a refusal makes the caller do
+/// (ask by halves, ask the guards, copy whole) is what it does when the kernel
+/// is not asked, and the kernel's bits are not reset by a call that fails, so
+/// no write is forgotten. A remembered refusal holds only while nothing in the
+/// address space changed ([`address_space_changed`]: every allocation, free,
+/// mapping and unmapping the runtime and we tell of, and once a second
+/// whatever happened), so memory that became write-watched since is asked
+/// again; until then it is answered as it was the moment before.
+fn ask_refused_again() -> bool {
+    !crate::toggled!("VICTORY_ASK_REFUSED")
+}
+
+/// Ranges of pages `(first, last)` the kernel refused, as of
+/// [`REFUSAL_EPOCH`]'s value `epoch`, and when they were first noted.
+struct Refusals {
+    epoch: u64,
+    since: Option<std::time::Instant>,
+    ranges: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<PageHash>>,
+}
+
+static REFUSALS: RwLock<Refusals> =
+    RwLock::new(Refusals { epoch: 0, since: None, ranges: std::collections::HashSet::with_hasher(std::hash::BuildHasherDefault::new()) });
+
+/// Counts every change of the address space we are told of: a refusal noted
+/// under another count is forgotten.
+static REFUSAL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long a refusal is remembered at most, whatever is told.
+const REFUSAL_LASTS: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Memory was allocated, freed, mapped or unmapped somewhere: the kernel may
+/// answer for ranges it refused before ([`ask_refused_again`]).
+pub(crate) fn address_space_changed() {
+    REFUSAL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the kernel refused `(first, last)` and nothing changed since.
+fn refused_before(first: usize, last: usize) -> bool {
+    if ask_refused_again() {
+        return false;
+    }
+    let epoch = REFUSAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    let r = REFUSALS.read().unwrap_or_else(|e| e.into_inner());
+    r.epoch == epoch && r.since.is_some_and(|at| at.elapsed() < REFUSAL_LASTS) && r.ranges.contains(&(first, last))
+}
+
+/// The kernel refused `(first, last)` in a call made with the epoch at `epoch`.
+fn note_refused(first: usize, last: usize, epoch: u64) {
+    if ask_refused_again() {
+        return;
+    }
+    let mut r = REFUSALS.write().unwrap_or_else(|e| e.into_inner());
+    // (A change during the call: what it says may be of before.)
+    if epoch != REFUSAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if r.epoch != epoch || r.since.is_none_or(|at| at.elapsed() >= REFUSAL_LASTS) {
+        r.ranges.clear();
+        r.epoch = epoch;
+        r.since = Some(std::time::Instant::now());
+    }
+    r.ranges.insert((first, last));
+}
+
+/// Since the last line, for each [`Site`]: refusals, their nanoseconds; and
+/// refusals not asked again.
+#[cfg(feature = "diagnostics")]
+static REFUSED: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+
+/// [`REFUSED`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn refusals() -> [u64; 13] {
+    std::array::from_fn(|i| REFUSED[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
-fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+fn kernel_written(first: usize, last: usize, site: Site) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if refused_before(first, last) {
+        #[cfg(feature = "diagnostics")]
+        REFUSED[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let epoch = REFUSAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = site;
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -272,8 +381,13 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         {
             tally(10, u64::from(failed));
             tally(11, started.elapsed().as_nanos() as u64);
+            // (Refusals by site at 0..6, answers at 7..13.)
+            let at = if failed { 0 } else { 7 } + site as usize * 2;
+            REFUSED[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            REFUSED[at + 1].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         if failed {
+            note_refused(first, last, epoch);
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -556,7 +670,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
+            && let Some(pages) = kernel_written(first, last, Site::Rest)
         {
             written.extend(pages);
             ahead.push((first, last));
@@ -629,7 +743,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
+    if let Some(pages) = kernel_written(first, last, Site::Run) {
         written.extend(pages);
         asked.push((first, last));
         return;
@@ -685,7 +799,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    let pages = match if refused { None } else { kernel_written(first, last, Site::Range) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -752,9 +866,45 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    j.nothing_after(first, taken, ranged)
 }
+
+impl Journal {
+    /// Whether no page from `first` on, as many as `taken` has, was written
+    /// after its taking (`taken`, or `ranged` if later; a page never taken
+    /// counts as due unless `ranged` holds it).
+    ///
+    /// By runs of [`CHUNK`] pages: one whose newest write is no newer than
+    /// the oldest taking of its pages holds nothing new, and its pages are
+    /// not looked at one by one (the title's 174 MB heap is 2,700 pages,
+    /// nearly all of them written some time, asked about thousands of times
+    /// a frame: 5 % of the submitting thread, run d0Prof).
+    fn nothing_after(&self, first: usize, taken: &[u64], ranged: u64) -> bool {
+        let last = first + taken.len();
+        if ranged == 0 && taken.contains(&0) {
+            return false;
+        }
+        let mut chunk = first / CHUNK;
+        while chunk * CHUNK < last {
+            let (a, b) = ((chunk * CHUNK).max(first), ((chunk + 1) * CHUNK).min(last));
+            chunk += 1;
+            let Some(&newest) = self.chunks.get(&(a / CHUNK)) else {
+                continue;
+            };
+            let least = taken[a - first..b - first].iter().fold(u64::MAX, |m, &t| m.min(t.max(ranged)));
+            if newest <= least {
+                continue;
+            }
+            if !self.written.range(a..b).all(|(&page, &write)| write <= taken[page - first].max(ranged)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Pages to a run of [`Journal::chunks`].
+const CHUNK: usize = 64;
 
 impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
@@ -1118,6 +1268,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    address_space_changed();
     if len == 0 || !known_holes() {
         return;
     }
@@ -1206,7 +1357,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+#[cfg_attr(feature = "diagnostics", track_caller)]
+fn guards_timed() -> GuardsLock {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1442,11 +1594,87 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+/// The guards' lock as held.
+#[cfg(not(feature = "diagnostics"))]
+type GuardsLock = std::sync::MutexGuard<'static, Guards>;
+#[cfg(feature = "diagnostics")]
+type GuardsLock = held::Held;
+
+#[cfg_attr(feature = "diagnostics", track_caller)]
+fn guards() -> GuardsLock {
+    #[cfg(feature = "diagnostics")]
+    let at = std::panic::Location::caller();
+    let g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+    };
+    #[cfg(feature = "diagnostics")]
+    let g = held::Held::new(g, at);
+    g
+}
+
+/// Diagnostics: how long the guards' lock is held, by the line that took it,
+/// for the line of the lock waits (the waits are for those holders).
+#[cfg(feature = "diagnostics")]
+mod held {
+    use super::{GUARDS, Guards};
+    use std::sync::Mutex;
+
+    pub(super) struct Held {
+        g: std::sync::MutexGuard<'static, Guards>,
+        since: std::time::Instant,
+        at: &'static std::panic::Location<'static>,
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+
+    /// By line: times taken, nanoseconds held, the longest.
+    static HOLDERS: Mutex<Vec<(u32, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+    impl Held {
+        pub(super) fn new(g: std::sync::MutexGuard<'static, Guards>, at: &'static std::panic::Location<'static>) -> Held {
+            let _ = &GUARDS;
+            Held { g, since: std::time::Instant::now(), at }
+        }
+    }
+
+    impl std::ops::Deref for Held {
+        type Target = Guards;
+        fn deref(&self) -> &Guards {
+            &self.g
+        }
+    }
+
+    impl std::ops::DerefMut for Held {
+        fn deref_mut(&mut self) -> &mut Guards {
+            &mut self.g
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let ns = self.since.elapsed().as_nanos() as u64;
+            let line = self.at.line();
+            let mut all = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+            match all.iter_mut().find(|h| h.0 == line) {
+                Some(h) => {
+                    h.1 += 1;
+                    h.2 += ns;
+                    h.3 = h.3.max(ns);
+                }
+                None => all.push((line, 1, ns, ns)),
+            }
+        }
+    }
+
+    /// The busiest holders since the last call, per frame, taken.
+    pub(crate) fn holders(frames: f64) -> String {
+        let mut all = std::mem::take(&mut *HOLDERS.lock().unwrap_or_else(|e| e.into_inner()));
+        all.sort_by_key(|h| std::cmp::Reverse(h.2));
+        all.iter()
+            .take(8)
+            .map(|h| format!("watch.rs:{} {:.0}x {:.2} ms (longest {:.2})", h.0, h.1 as f64 / frames, h.2 as f64 / 1e6 / frames, h.3 as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2267,6 +2495,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    address_space_changed();
     if !view_guard() {
         return;
     }
@@ -2294,6 +2523,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    address_space_changed();
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -2479,6 +2709,7 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    address_space_changed();
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2528,6 +2759,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    address_space_changed();
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
     // What the writers watch keeps read-only there is read-write now.
@@ -2540,6 +2772,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    address_space_changed();
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -2564,6 +2797,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    address_space_changed();
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2616,7 +2850,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> GuardsLock {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2849,6 +3083,7 @@ mod parts_tests {
         let mut j = Journal {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
@@ -2869,6 +3104,55 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    /// The look by runs of pages says what a look at every page says, for
+    /// ranges across runs, pages never taken, and a range taken whole.
+    #[test]
+    fn nothing_new_by_runs_is_nothing_new_by_pages() {
+        let mut j = Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        // A small generator, the same every run.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let by_pages = |j: &Journal, first: usize, taken: &[u64], ranged: u64| {
+            (ranged != 0 || taken.iter().all(|&t| t != 0))
+                && j.written.range(first..first + taken.len()).all(|(&p, &w)| w <= taken[p - first].max(ranged))
+        };
+        let mut agreed = [0; 2];
+        for round in 1..=4000u64 {
+            // Writes into some 600 pages, the newer the later.
+            for _ in 0..next(4) {
+                j.note(1000 + next(600) as usize, WHOLE, round);
+            }
+            let first = 1000 + next(500) as usize;
+            let len = 1 + next(200) as usize;
+            // Taken at about now, some pages a little earlier, some never.
+            let taken: Vec<u64> = (0..len)
+                .map(|_| match next(50) {
+                    0 => 0,
+                    1..=5 => round.saturating_sub(next(40)),
+                    _ => round,
+                })
+                .collect();
+            let ranged = if next(10) == 0 { round.saturating_sub(next(5)) } else { 0 };
+            let want = by_pages(&j, first, &taken, ranged);
+            assert_eq!(j.nothing_after(first, &taken, ranged), want, "round {round}");
+            agreed[usize::from(want)] += 1;
+        }
+        // Both answers came up often.
+        assert!(agreed[0] > 100 && agreed[1] > 100, "{agreed:?}");
     }
 }
 
@@ -3656,6 +3940,64 @@ mod tests {
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// The kernel's refusal of a range is remembered until the address space
+    /// changes, and a remembered one is answered as a refusal is.
+    #[test]
+    fn a_refusal_is_remembered_until_the_address_space_changes() {
+        let plain = vec![0u8; 4 * PAGE];
+        let (first, last) = ((plain.as_ptr() as usize).div_ceil(PAGE), plain.as_ptr() as usize / PAGE + 3);
+        // (Other tests change the address space meanwhile: tried until a
+        // round met no change.)
+        let remembered = (0..100).any(|_| {
+            let _range = Asking::hold(first, last);
+            assert!(kernel_written(first, last, Site::Range).is_none(), "the process heap is not write-watched");
+            refused_before(first, last)
+        });
+        assert!(remembered);
+        address_space_changed();
+        assert!(!refused_before(first, last));
+        // A remembered refusal is never taken for an answer.
+        for _ in 0..3 {
+            assert!(writes(first * PAGE, last * PAGE, false).is_none());
+            assert!(writes(first * PAGE, last * PAGE, true).is_none(), "nor is it a view");
+        }
+    }
+
+    /// View memory the kernel refuses is answered by its guards, the refusal
+    /// remembered or not: a write through the other view, a second one after
+    /// the refusal is remembered, a kernel write, all are told.
+    #[test]
+    fn view_memory_refused_before_misses_no_write() {
+        use std::io::{Read, Seek, Write};
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let page = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let seen = |block: usize| {
+            let (now, written) = writes(guarded, guarded + SIZE, true).expect("view memory is guarded");
+            written.iter().any(|&(p, w)| p == page(block) && w == now)
+        };
+        let _ = writes(guarded, guarded + SIZE, true).expect("view memory is guarded");
+        assert!(!seen(0) && !seen(1), "nothing written yet");
+        for round in 0..3 {
+            // SAFETY: the other view, read-write once the handler opened it.
+            unsafe { ((other + BLOCK + 8 + round) as *mut u8).write(1) };
+            assert!(seen(1), "round {round}");
+            assert!(!seen(1), "round {round}: told once");
+        }
+        // A kernel read into the guarded view, opened for it.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        file.rewind().unwrap();
+        {
+            let _open = kernel_writing(guarded + 100, 13);
+            // SAFETY: 13 bytes of our view.
+            let into = unsafe { std::slice::from_raw_parts_mut((guarded + 100) as *mut u8, 13) };
+            assert_eq!(file.read(into).unwrap(), 13);
+        }
+        assert!(seen(0));
         drop_views(section, &[guarded, other], SIZE);
     }
 

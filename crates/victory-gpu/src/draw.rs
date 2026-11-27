@@ -2666,7 +2666,16 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // `VICTORY_RELOOK_MS` sets the four seconds (after the fork
+        // rorodev6/victory-nvidia-megafork 77e13a9, trustno1-coder, where it
+        // is 20,000: there the opening cutscene looked at some 20,000 slots
+        // waiting for their memory every 16 frames). Longer means a texture
+        // the title changes with nothing to tell of it is seen later.
+        static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let relook = *RELOOK_MS.get_or_init(|| {
+            std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|&ms| ms > 0).unwrap_or(4000)
+        });
+        let most = (relook / took).clamp(16, 256.max(relook / 16));
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,

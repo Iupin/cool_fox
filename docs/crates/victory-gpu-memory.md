@@ -144,6 +144,11 @@ return or make a copy. A 1024-entry hash cache sits in front of them (`FOUND`,
   `aliased`, and `opened` (rest timestamps).
 - Lock-free bitmaps `PUBLISHED`, `PROTECTED` and `BESIDE` (`watch.rs:951-969`),
   read by the fault handler without the lock.
+- Diagnostics builds time how long `GUARDS` is held, by the line that took
+  it (`guards()` and `guards_timed()` are `#[track_caller]` there and hand
+  out `held::Held`, which counts on drop): the copystat line `waits for the
+  write trackers' locks` ends with `the guards held by: watch.rs:<line> Nx
+  T ms (longest L)`, the eight busiest.
 - `MAPPING: RwLock<()>` (`watch.rs:2243`): held shared by in-place reads of title
   memory (`title_memory_reading`) and exclusive by the runtime while it remaps
   (`title_memory_remapping`). Without it, a page went away between "is it
@@ -186,7 +191,15 @@ deferred refresh:
 1. **`Shadow::nothing_new`** (`shadow.rs:3903`): if the copy is watched or
    guarded, no declared range overlaps, and the journal already says that no
    page was written after `copied`, nothing is done and the kernel is not asked.
-   This is the hot fast path.
+   This is the hot fast path. Since 2026-11-27 the journal keeps, for each
+   run of 64 pages (`CHUNK`), the newest asking that found a page there
+   written (`Journal::chunks`, raised in `Journal::note`, never lowered,
+   as the pages' own entries); `Journal::nothing_after` passes over a run
+   whose newest write is no newer than the oldest taking of its pages, and
+   looks at a run's pages one by one only otherwise. The answer is the same
+   (a unit test compares both on 4,000 random cases); the title's 174 MB
+   heap is 2,700 pages, nearly all written some time, and this check was
+   5 % of the submitting thread (run d0Prof).
 2. **`Shadow::update`** (`shadow.rs:3862`) skips declared ranges and refreshes
    the gaps with `update_free`.
 3. **`update_free`** (`shadow.rs:3939`) calls `watch::writes(from, to, guarded)`.
@@ -195,6 +208,25 @@ deferred refresh:
    `watch.rs:1636`). Then `copy_stale` copies only the stale pages, or parts.
 4. **Slow path**: memory that is neither watched nor guarded is marked
    `NOT_WATCHED` and copied whole at every refresh (`shadow.rs:3955-3964`).
+
+Host memory handed to the title (2026-11-27, `watched.rs`,
+`VICTORY_WATCHED_HEAP`, on): blocks of 64 KiB or more that the title's
+general allocator takes from the host (`XMemAllocDefault` in victory-hle,
+which the title's own allocation hooks fall back on) and the heaps the title
+makes through the device (`resource::Memory::new`) are reservations of their
+own made with `MEM_WRITE_WATCH`, so a host copy of a buffer there takes the
+fast path above instead of the slow one. Before, such memory came from the
+process heap: the title's upscaler scratch buffer (21,045,760 bytes, at a
+host address above 2^40) was copied whole twice a frame and sent up whole to
+its card copy every frame. Layout: whole 64 KiB of reservation around the
+caller's bytes, so an asking about their 64 KiB pages never reaches into the
+next reservation (which the kernel refuses); one committed 4 KiB page below
+them, whose first word holds the reservation's base for `watched::free`
+(victory-hle's block header, `[size, 0]`, lies just below the pointer). The
+kernel counts every writer: the title, the kernel's own writes (a `ReadFile`
+into the block, tested) and our landings, which are then compared by the next
+refresh (`VICTORY_LAND_ECHO`) and not sent up again. Smaller blocks stay on
+the process heap.
 
 Copies of title memory use `safecopy::copy` (`safecopy.rs`). It is one
 `rep movsb`. A fault inside it is caught by the same vectored handler
@@ -206,6 +238,24 @@ Kernel-call batching: `ask_ahead` / `ask_once` (`watch.rs:315,530`) ask once
 for all of a submission's ranges that lie within 8 MiB of each other. With
 `VICTORY_ASK_EARLY`, the thread `victory-ask-early` asks hot pieces in advance
 while the title records.
+
+Refusals remembered (2026-11-27, `VICTORY_ASK_REFUSED`, on): a call the
+kernel refuses (the range is not write-watched memory of one reservation)
+costs about what an answer does, 25 µs and more whatever the range, and two
+in three of a frame's ~540 askings were refused, the same ranges every frame:
+view memory (guarded instead), runs of a submission's ranges across two
+reservations (then asked by halves, `ask_run`), memory that is not watched.
+`kernel_written` keeps the exact page ranges refused (`REFUSALS`) and does not
+ask about them again while `REFUSAL_EPOCH` is unchanged and for at most a
+second. The epoch moves at every change of the address space we are told of
+(`address_space_changed`: `title_memory_allocated`, `_freed`, `_remapping`,
+`_remapped`, `_unmapping`, `_splitting`, `views_mapped`, and
+`watched::alloc`/`free`); a refusal noted by a call during which it moved is
+not kept. Why nothing is lost: a remembered refusal makes the caller do what
+a refusal does (ask by halves, ask the guards, copy whole), and a call that
+fails resets no kernel bit, so memory that became write-watched since keeps
+its bits until it is asked again. The diagnostics line `askings the kernel
+refused per frame` counts refusals by caller and those not asked again.
 
 ### 3.4 Write faults: the guard handler
 
@@ -384,6 +434,16 @@ Per submission (`Host::card_before`, `host.rs:4247`; `card_back`, `host.rs:4994`
    into title memory and the CPU side (Shadow::card_merge / card_merge_relay)
 ```
 
+What changed on the CPU sides is taken by `shadow::card_dirty`. Since
+2026-11-27 (`VICTORY_CARD_TOUCHED`, on) it takes only the copies in
+`TOUCHED`, a list a copy is put into when its `touched` flag goes from unset
+to set; before, every submission looked at all ~3,700 card copies (3.8 % of
+the submitting thread in a gameplay profile). The rule it rests on is the
+old one: what puts ranges into `dirty` sets `touched` under `dirty`'s lock,
+and what takes `dirty` clears `touched` under it, so a change after a take
+puts the copy into the list again and one before is in what the take took.
+A copy changed before it was registered is put in by `carded`.
+
 Writes outside declared ranges are not found. Later shaders see them, and they
 reach the title only when a declared range later covers their piece
 (`shadow.rs:163-166`). `picked.rs` covers views picked by index.
@@ -474,6 +534,40 @@ Card steps are refused, and the old wait taken, when:
 `plan`, `holder` and `elsewhere` decide this. The motivation was 25-30 ms of a
 105 ms frame spent waiting for skinning passes that write through a view of the
 whole 174 MB heap.
+
+Copies at their place (`place.rs`, below) and card steps (2026-11-27):
+
+- A fill behind a copy at its place that reads only bytes the copy writes is
+  done on the card from the copy's source (`forward`,
+  `VICTORY_PLACED_FORWARD`, on). The title copies a few hundred bytes of
+  constants into its ring with a `CopyBufferRegion`, and a draw behind it in
+  the same list reads them as a constant buffer; the ring lies in the heap the
+  skinning passes declare written, so the fill is a card step, done in front
+  of the lists, before the copy. Every such submission was refused and waited
+  60-80 ms for the flights (all the refusals of the 2026-11-27 runs). Taken
+  only where it is what the CPU reads after the wait: nothing between copy and
+  fill writes the fill's bytes or the copy's source, no copy at its place
+  ahead of the fill writes the source, source and destination do not meet.
+  A copy at its place is in the way only of the card steps behind it.
+  `VICTORY_CARD_STEPS_CHECK=1` reads back what each such fill was given and
+  compares it with title memory after the landing.
+- Two holes closed: with card steps taken, the CPU's waits for a copy at its
+  place were skipped. A copy whose source is taken from title memory at
+  submission (no shader writes that memory) while a flight may write it, or
+  behind a card step that writes it, read it too early; a step left on the CPU
+  behind a copy that flights keep out of title memory read its destination
+  without the copy. Both are refused now (`PLACED_SOURCE`, `PLACED_READ`), as
+  the CPU's way waits for them (`Placed::waits`, `place::read_by`).
+- Planning them costs the submitting thread some 7 ms a frame for the
+  5,000-8,000 fills of the ring (the timeline of run f1Diag1, four frames:
+  the slots 5.4 ms a frame, choosing 2.9, the list 2.5, what holds their
+  bytes 1.5). What holds each fill's bytes is looked up by pieces of memory
+  (`ByPiece`, `VICTORY_HOLDER_INDEX`, on) instead of over every range the
+  flights declared; the slots are made on threads of their own
+  (`land::each_steps`, `VICTORY_SLOTS_APART`, on), not on those the landing
+  also uses (a pool runs one batch at a time, and the slots waited for a
+  landing's), and what the slots held before is retired under one lock per
+  thread (`descriptor::constant_slots`, `host::retire_resources`).
 
 `host/place.rs` (`VICTORY_COPIES_IN_PLACE`, on): the title's buffer copy runs in
 the destination's host copy at its list position. Its bytes count as a shader
@@ -629,12 +723,15 @@ a piece of a block.
 
 | Rule | Where |
 |---|---|
-| Pieces larger than half a block (larger than a block with ripe blocks) are not pooled | `take_ripe`, `pool.rs:227` |
+| **Compact pool** on cards whose DXGI budget is 12 GiB or less (`pool::compact`, decided with the first budget known; `VICTORY_POOL_COMPACT=0` never, `=1` always): texture blocks of 16 MiB (`SMALL_BLOCK`), pieces cut from the *fullest* ripe block with room (not the first), and a cap on the bytes of all blocks: a new block only while they stay within `cap_bytes` = min(budget/4, held + `slack_bytes`), slack = budget/16 (at least 4 blocks). Past the cap a texture gets an allocation of its own (as with the pool off), counted in the pool line. Empty blocks kept: budget/32 worth (17 of 16 MiB on 8,980 MB) instead of 64 of 64 MiB. Staging blocks are unchanged (64 MiB). Larger cards keep everything as it was. | `pool.rs` `compact`, `cap_bytes`, `slack_bytes`, `Pool::take_ripe`, `spares` |
+| The **pool line** (INFO, every 5 s, any build, both modes): blocks and their MB, MB textures hold, MB free and how much of it counts as room, the cap, textures given memory of their own at the cap, blocks made and let go, staging blocks, title-filled host copies alive / let go / made again, passes refused for room, the card's use against its budget, `room`, and both reserves. | `pool::say` |
+| Pieces larger than half a block (larger than a block with ripe blocks) are not pooled | `take_ripe` |
 | A piece given back rests `REST` = 2500 ms before reuse. The module comment says "two seconds", which is out of date. | `pool.rs:76,301` |
 | **Ripe blocks**: `VICTORY_RIPE_BLOCKS` (12) blocks are made ahead, and pieces are cut from blocks that every submission begun before their creation has finished. A device loss came from lists already on the card reading a new block's texture. | `pool.rs:87-125` |
 | Growth back-off: a failed block creation blocks growth for 500 ms. Existing free ranges are still used. | `Pool::grow`, `pool.rs:278` |
 | Spare empty blocks: 64 (`SPARE_KEPT`) while VRAM use is below 85% and `keep_freed` is on, else 2. Staging: 8; 1 under pressure; 0 under critical commit. | `pool::room`, `pool.rs:44-71` |
 | Speculative (picked, not bake) staging may grow a new block only with `residency::allow_staging_growth` | `pool.rs:389-395` |
+| The first upload of a texture puts an aliasing barrier on it only if it may lie where another did (`pool::may_alias`: cut from a block, or reserved). A texture with memory of its own gets none: the host refuses the list ("committed resource memory cannot be aliased"), which ended launches once the compact pool made such textures common. | `texture::record_upload`, `pool::may_alias` |
 | A reused staging piece is zeroed so unmapped levels upload zeros | `pool.rs:403-408` |
 
 ### 4.4 Uploads ahead on a copy queue (`texture/ahead.rs`)
@@ -695,9 +792,10 @@ The slot mechanics belong to the descriptor code; see
   - To check it is working, look for the info line
     `textures with levels on demand: N alive ...` (`tiles.rs`), or
     `VICTORY_CARD_ACCOUNTING=1` in a diagnostics build.
-  - Known gap: the pool does not hand back the blocks this empties. In the
-    same measurement the pool held 5,376 MB in blocks for about 2,200 MB of
-    pooled textures, so the card still read as nearly full.
+  - The pool did not hand back the blocks this emptied: in the same
+    measurement it held 5,376 MB in blocks for about 2,200 MB of pooled
+    textures, so the card still read as nearly full. On cards of 12 GiB or
+    less the compact pool (§4.3) bounds that since 2026-11-27.
 
 ### 4.7 Sparse (console tiled) memory
 
@@ -759,11 +857,12 @@ memory falls.
 
 | Knob | Rule |
 |---|---|
-| `resource::room` (`resource.rs:1676`) | New host copies of picked textures are always allowed up to `texture_floor_bytes` (2 GiB or budget/4). Beyond that, (VRAM used − free pool texture room + `card_room_kept` + `targets_room_kept`) must be below `room_percent` (90%) of the budget. `VICTORY_TEXTURE_BUDGET_MB` replaces the rule with a byte cap on title-filled copies. With no budget reported the limit is 4 GiB. |
-| `targets_room_kept` | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3072, at most 8192) minus the bytes of render targets and other host-written textures. |
+| `resource::room` | New host copies of picked textures are always allowed up to `texture_floor_bytes` (2 GiB or budget/4; budget/6 with the compact pool). Beyond that, (VRAM used − free pool texture room + `card_room_kept` + `targets_room_kept`) must be below `room_percent` (90%) of the budget. With the compact pool the free pool room counted is at most `pool::slack_bytes` (budget/16): free space beyond it is what the world's load left scattered, which textures with levels on demand cannot use at all. `VICTORY_TEXTURE_BUDGET_MB` replaces the rule with a byte cap on title-filled copies. With no budget reported the limit is 4 GiB. |
+| `targets_room_kept` | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3072, at most 8192) minus the bytes of render targets and other host-written textures. With the compact pool, once the world's first frames have made them (`note_targets`, once a second: they rose by 512 MiB within 20 s from a low of at least 64 MiB; logged once), at most `TARGETS_MARGIN` (512 MiB) is kept: on the RTX 3080 the targets were 1,360 MB and 1.7 GB had been kept for the rest of the session. |
+| `resource::let_go_idle` order | With a limit (`vram_keep`) and the compact pool, the sweep first lets go of idle copies whose going gives memory back (their own allocation, or a piece in a block holding half of itself or less: `pool::sparse`), longest idle first, then the others. The sweep's "used" figure uses the same capped pool room. |
 | `shadow::card_room_kept` | Room reserved for card copies not yet made: the `card_limits` cap, at most 1 GiB (`SEEN`), minus what was made or refused for VRAM room (`CARD_REFUSED`; copies refused by the cap or the small share give up nothing). Since 2026-11-26 the cap of a ≤ 12 GiB budget is above 1 GiB from about 7 GiB of budget, so 1 GiB is held back there (512 MiB before), the same as in the measured-fine run with `VICTORY_CARD_BUFFERS_MB=1280`. |
 | `card_room_for` | Card copies of buffers allowed up to 80% (or 97%) of the budget, plus the `card_limits` cap and, on ≤ 12 GiB budgets with the default cap, the small copies' share (§3.5, `card_admit`). |
-| `pool::room` | Spare blocks kept below 85% use. |
+| `pool::room` | Spare blocks kept below 85% use (budget/32 worth with the compact pool). Logs the pool line every 5 s. |
 | `host::video_memory` (`host.rs:9375`) | The DXGI budget and usage source, `[budget, used, ..]`. |
 
 Diagnostics: `VICTORY_CARD_ACCOUNTING=1` (`draw.rs:2432`, line text
@@ -878,7 +977,11 @@ launcher sets, with the value it sets.
 | `VICTORY_RELAY_COPY` | host.rs:2505 | off; **L**=1 | Relay fetches go over a copy queue. |
 | `VICTORY_FETCH_CHECK` | host/torn.rs:35 | off | Hash fetched pieces to catch torn fetches. |
 | `VICTORY_CARD_STEPS` | host/card_steps.rs:79 | 0; **L**=2 | 1 fills, 2 fills and copies on the card (§3.7). |
-| `VICTORY_PLACED_ORDER` | host/card_steps.rs:103 | off | Cut a submission behind an in-place copy instead of refusing card steps. |
+| `VICTORY_PLACED_ORDER` | host/card_steps.rs `placed_order` | off | Cut a submission behind an in-place copy instead of refusing card steps. |
+| `VICTORY_PLACED_FORWARD` | host/card_steps.rs `placed_forward` | on | A fill behind an in-place copy that reads only its bytes is done on the card from the copy's source (§3.7); `0`: refused, the submission waits. |
+| `VICTORY_CARD_STEPS_CHECK` | host/card_steps.rs `check` | off | `1`: what those fills were given is read back and compared with title memory after the landing (a warning per frame line if any differ). |
+| `VICTORY_HOLDER_INDEX` | host/card_steps.rs `holder_index` | on | What holds a card step's bytes is looked up by pieces of memory; `0`: over every declared range, per fill. |
+| `VICTORY_SLOTS_APART` | host/card_steps.rs `slots_apart` | on | The slots of card-step fills are made on threads of their own (`VICTORY_STEPS_THREADS`, 4), retired in one lock per thread; `0`: on the threads the landing uses too. |
 | `VICTORY_COPIES_IN_PLACE` | host/place.rs:43 | on | Title buffer copies on the card at their list position. |
 | `VICTORY_FILL_TITLE` | host.rs:2809 | off | An experiment named in the card-steps docs. |
 | `VICTORY_JOIN_COPIES` | host.rs:3773 | off; **L**=1 | Join adjacent title copies into one kernel copy. |
@@ -892,6 +995,7 @@ launcher sets, with the value it sets.
 | `VICTORY_CARD_ALL` | shadow.rs:511 | off | Every buffer gets two sides (small ones in PC memory). |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | shadow.rs:415 | on | Reserve VRAM for card copies. The doc at shadow.rs:386 says "off", which is stale; the code and shadow.rs:404 say on. |
 | `VICTORY_CARD_HASH_LEN` | shadow.rs:4437 | on | Hash only the title buffer's own bytes, not the 64 KiB-rounded buffer. |
+| `VICTORY_CARD_TOUCHED` | shadow.rs `touched_list` | on | Submissions take only the card copies whose CPU side changed (§3.5); `0`: look at all of them, as before 2026-11-27. `VICTORY_AB`-switchable. |
 | `VICTORY_CARD_WINDOWS_MB` | shadow.rs:635 | 0 | Cap on windows with a VRAM side. |
 | `VICTORY_WINDOWS_BAR_MB` | shadow.rs:673 | 0 | Cap on windows in `GPU_UPLOAD` (BAR) heaps. |
 | `VICTORY_WINDOWS_OWN` | shadow.rs:711 | off | Two sides for windows. |
@@ -934,8 +1038,10 @@ launcher sets, with the value it sets.
 | `VICTORY_KNOWN_HOLES` | watch.rs:1070 | on (with light refresh) | Cache placeholder holes until the runtime reports a change. |
 | `VICTORY_LIGHT_REFRESH` | watch.rs:826 | on | Answer guarded ranges from bits, without the guard lock. |
 | `VICTORY_PAGE_PARTS` | watch.rs:54 | on | Track 4 KiB parts. |
+| `VICTORY_WATCHED_HEAP` | watched.rs `on` | on | Blocks of 64 KiB or more of host memory handed to the title (its allocator's, device heaps) are write-watched reservations (§3.3); `0`: the process heap, copied whole at every refresh. |
 | `VICTORY_TAKE_PARTS` | watch.rs:787 | on | Re-take only the parts written. |
 | `VICTORY_ASK_ONCE` | watch.rs:524 | on | One write-watch asking per submission. |
+| `VICTORY_ASK_REFUSED` | watch.rs `ask_refused_again` | on (remembered) | `0`: ask the kernel again about ranges it refused, every time, as before 2026-11-27 (§3.3). `VICTORY_AB`-switchable. |
 | `VICTORY_ASK_EARLY` | watch.rs:403 | unset = off; a value = every N ms (2 if it does not parse) | Asks while the title records. |
 | `VICTORY_PAGE_WRITES` | watch.rs:2116 | `guards` (bit 1) | What to do with DirectStorage page writes: `0`, `1`, `slots`, `all`. |
 | `VICTORY_SAFE_COPY` | safecopy.rs:325 | on | `rep movsb` with fault recovery instead of kernel copies. Also installs the handler. |
@@ -967,7 +1073,8 @@ launcher sets, with the value it sets.
 | `VICTORY_TEXTURE_SAME` | texture.rs:1620 | on | Skip re-uploads of byte-identical memory. |
 | `VICTORY_COMMITTED_QUERY` | texture.rs:1697 | off | Use `VirtualQuery` walks to ask whether memory is committed. |
 | `VICTORY_MAPPED_BY_VIEWS` / `_BY_PAGE` | texture.rs:1782,1792 | on / off | How mapped bytes are counted. |
-| `VICTORY_TEXTURE_POOL` | pool.rs:84 | on | Pooled 64 MiB blocks. |
+| `VICTORY_TEXTURE_POOL` | pool.rs `on` | on | Pooled blocks (64 MiB; 16 MiB with the compact pool). |
+| `VICTORY_POOL_COMPACT` | pool.rs `compact` | by the budget: on at 12 GiB or less | The compact pool and its room rules (§4.3, §5.2); `0` never, `1` always. |
 | `VICTORY_RIPE_BLOCKS` | pool.rs:101 | 12 | Blocks made ahead. |
 | `VICTORY_UPLOAD_AHEAD` | texture/ahead.rs:46 | off; **L**=1 | First uploads on our copy queue. |
 | `VICTORY_SHOW_AFTER` | descriptor/host.rs:292 | off (`!=0` turns it on); **L**=1 | Slots show a new texture after its upload. |
@@ -981,7 +1088,7 @@ launcher sets, with the value it sets.
 |---|---|---|---|
 | `VICTORY_TEXTURE_BUDGET_MB` | resource.rs:1681 | unset | Byte cap instead of the VRAM percentage rule. |
 | `VICTORY_TEXTURE_ROOM_PERCENT` | resource.rs:1768 | 90 (50 to 97) | Share of the VRAM budget for picked-texture copies. |
-| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | resource.rs:1729 | 3072 | VRAM reserved for render targets. |
+| `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | resource.rs `targets_room_kept` | 3072 | VRAM reserved for render targets; with the compact pool at most 512 MiB once the world has made them. |
 | `VICTORY_TEXTURE_SWEEP` | resource.rs:2020,2070 | on; `whole` = whole table each look | Let idle host copies go. |
 | `VICTORY_TEXTURE_KEEP` | resource.rs:2037 | keep (any value except `0` or `1`) | `0` or `1` disables the budget-ordered keep and uses `vram_idle_ms`. It is odd that `1` also disables it. |
 | `VICTORY_CARD_ACCOUNTING` | draw.rs:2432 | off | The VRAM accounting line. |
@@ -1020,7 +1127,8 @@ launcher sets, with the value it sets.
 3. Flights land in order, and fences and bottom-of-pipe writes come after their
    flight's landing (§3.6).
 4. Pool pieces are never reused within 2500 ms or while a list names them.
-   Pieces come from ripe blocks.
+   Pieces come from ripe blocks. A block is let go only when wholly empty
+   (the compact pool changes which block a piece is cut from, never this).
 5. Objects let go are dropped only `bury_lag` submissions after the last one
    that may use them (`retire`, `bury`, `host.rs:462-519`).
 6. `ASKING` is taken before the journal lock and never under it. `merging` is
@@ -1120,12 +1228,13 @@ Do not run them while another build holds the target directory.
 
 | File | Tests (ignored) | Covers |
 |---|---|---|
-| `watch.rs` | 40 | The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
+| `watched.rs` | 3 | A write-watched block is zeroed and aligned, the kernel answers for its whole 64 KiB pages (uncommitted ones too), the journal tells its writes to every asker, a `ReadFile` into it is seen. |
+| `watch.rs` | 43 | The look at the journal by runs of 64 pages answers as page by page does. Refusals remembered until the address space changes, and view memory refused before missing no write (through the other view, twice, and a kernel read). The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
 | `writers.rs` | 12 | The writers watch on memory of the test's own: a write is told with its instruction, offset, size, value and count and is done; a write beside the range is counted only; a string store across two pages; a write through another view; a kernel read (`ReadFile`) refused while watched and landing under `kernel_writing`, told as the kernel's; the guards still report their block written; detail stops while counting goes on; the window arms and disarms; a range mapped after the window opened is watched then; a binding found by a draw is watched; switch parsing. |
-| `shadow.rs` | 33 (1) | Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
+| `shadow.rs` | 34 (1) | The touched list takes a changed card copy once (changed before and after registering, many times). Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |
 | `safecopy.rs` | 8 (1) | Every length and alignment. Only changed dwords are put. Faults become failures. |
-| `pool.rs` | 7 | Ranges, spares, growth back-off, rest, ripe blocks, reclaim. |
+| `pool.rs` | 13 | Ranges and their free bytes, spares (both modes), growth back-off, rest, ripe blocks, reclaim, the cap arithmetic, fullest-first placement, no block past the cap, larger cards unchanged, and a load-then-churn simulation (`blocks_follow_what_textures_hold_through_churn`) in which the compact pool stays under budget/4 and returns to held + slack while 64 MiB first-fit keeps what the load made. |
 | `residency.rs` | 3 | Reserves, pressure hysteresis, prefetch limits. |
 | `host/card_steps.rs` | 9 (1) | Planning and refusal rules, the order behind flights. |
 | `host/upcheck.rs` | 11 (10 ignored: GPU) | Undeclared writes, copy order. |
