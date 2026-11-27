@@ -86,7 +86,9 @@ in that order of size:
    copy them now.
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
    after fxceless c36971b2; not measured here yet), and the passes that run for nothing
-   without rays.
+   without rays. With rays it works 50-64 ms of a gameplay frame (2026-11-27, later):
+   since card steps are no longer refused, the slow launches are the ones where it is
+   busy all the time.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
@@ -300,3 +302,141 @@ cinematic and 17.1 → 13.8 in gameplay, beside the recording, not on the
 submitting thread; warnings of a texture picked by index that changed with
 nothing to tell of it 215 → 212. One launch each is within the spread
 between launches, so the default stays 4,000.
+
+## 2026-11-27, later: card steps no longer refused; the card is now the limit
+
+Same machine, launcher and method as the entry above (300 s launches, Enter
+by script, one game on the machine at a time; gameplay = 95 s after the
+world's first frame to the end). "Before" is the merged branch of that
+entry: two launches of ours and its two "after (all)" launches (the same
+code, run c3). "After" has the change below (f1) or it and the two that
+cheapen planning (f3).
+
+The refusals. Every refusal of card steps in the diagnostics launches was
+"a copy at its place in a list writes what it reads": the title copies 384
+or 480 bytes of constants into its ring with a `CopyBufferRegion`, and a draw
+behind it in the same list reads them as a constant buffer. The ring lies in
+the 174 MB heap (`0x…+0xae00000`) that eleven dispatches a frame declare
+written whole through one raw view of the title's bindless table (the
+title's own view of its whole heap, `descriptor::host::buffer_copy`; not a
+root view without a size, and not bounded by anything we see before the
+dispatches run: they write at places read out of job records). So the fill
+is a card step, done in front of the lists, before the copy, and was
+refused. Now such a fill reads the copy's source (`forward`,
+`VICTORY_PLACED_FORWARD`): what the CPU reads after the wait. 4-15 fills a
+frame go this way.
+
+Two holes in card steps closed on the way (the CPU's waits for a copy at its
+place were skipped whenever card steps were taken): a copy at its place
+whose source is taken from title memory at submission while a flight may
+still write it (came up twice in a 300 s diagnostics launch, as refusals
+now), and a CPU step behind a copy that flights keep out of title memory
+(not seen). Either handed the card older bytes than the CPU's way would.
+Neither is shown to be the stretched bodies: the first is rare, and the
+captures of these launches (world+300 to +1200 frames: the prison window,
+the yard through the glass) show no stretched body with or without the
+change; the red glow over the hair from about world+490 is in both.
+
+Release, gameplay (fps [low-high of the frame lines], ms a frame,
+"preparing", "on the GPU" = waits for flights, refused card steps a frame
+(last 20 lines), fills read through a copy, the card's queue busy (median;
+"nothing of ours queued" from the frame line), the submitting thread waiting
+for the card, CPU s a frame):
+
+| launch | fps | ms | preparing | on the GPU | refused | through a copy | card busy | waiting for card | CPU s/frame |
+|---|---|---|---|---|---|---|---|---|---|
+| before, ours 1 | 13.2 [10.4-14.6] | 76.0 | 60.7 | 0.0 | 0.00 | – | 75% | 0.0 | 0.77 |
+| before, ours 2 | 6.5 [4.0-10.6] | 154.4 | 82.8 | 47.2 | 0.64 | – | 90% | 51.6 | 1.14 |
+| before, c3 1 | 10.8 [7.2-12.3] | 92.6 | 66.9 | 5.7 | 0.08 | – | 88% | 8.0 | 0.93 |
+| before, c3 2 | 9.9 [4.0-14.0] | 100.5 | 59.5 | 21.3 | 0.53 | – | 92% | 18.4 | 1.00 |
+| f1 1 | 10.9 [9.4-12.3] | 92.0 | 45.2 | 13.9 | 0.00 | 14.7 | 96% | 13.1 | 0.89 |
+| f1 2 | 14.5 [11.9-15.3] | 68.9 | 55.4 | 0.7 | 0.00 | 4.2 | 79% | 0.5 | 0.85 |
+| f3 1 | 14.9 [14.3-15.7] | 67.2 | 54.4 | 0.7 | 0.00 | 7.0 | 86% | 0.5 | 0.82 |
+| f3 2 | 11.7 [10.6-12.4] | 85.5 | 48.3 | 9.5 | 0.00 | 15.0 | 96% | 9.2 | 0.90 |
+
+Refused submissions a frame: 0.00-0.64 before (two of four launches over
+0.5), 0.00 in all four after and in both diagnostics launches: that
+separates. The frame rate's median rose from 10.4 to 13.1 fps and preparing's
+from 63.8 to 51.4 ms, but the ranges overlap (6.5-13.2 against 10.9-14.9),
+so neither is shown by four launches against four. What the slow launches
+after have in common: the card. In both its queue was busy 96% of the time
+and the submitting thread waited for it 9-13 ms a frame; in the fast ones
+79-86% and 0.5 ms. Before, the slow launches were the refused ones. The
+card's own timestamps (`VICTORY_CARD_SPANS=1`, diagnostics launch f5bDiagAB,
+13.9 fps): it works 54.5 ms of a 73 ms gameplay frame (p10 50.3, p90 64.3),
+idle 17.7 ms between our submissions.
+
+Diagnostics, gameplay, before → f1 (one launch each), ms a frame of the
+submitting thread: waiting for flights 3.0 → 0.1; planning card steps 6.4 →
+7.3 (5,000-8,000 fills a frame are planned either way); the rest within the
+spread (asking the write watch 13.6 → 14.3, the lists' steps 27.2 → 26.8,
+the title's bytes under flights' writes 5.0 → 5.8, copies in the card's
+memory 8.3 → 8.5). The timeline of four frames of f1 split the planning:
+the slots of the fills 5.4 ms a frame, choosing 2.9, our list 2.5, what holds
+their bytes 1.5. The slots waited for a landing's batch on the same pool of
+threads (a pool runs one batch at a time) and some 150 times a frame each
+for a static lock: now on a pool of their own, retired in one lock per
+thread (`VICTORY_SLOTS_APART`); what holds the bytes is looked up by pieces
+(`VICTORY_HOLDER_INDEX`). Both switched by `VICTORY_AB` in one diagnostics
+launch (f5bDiagAB, phases of 16 s, two in gameplay for each pair but one),
+planning card steps a frame: neither 5.8 ms, the index alone 6.0, the slots
+apart alone 4.7, both 5.0. The slots save about 1 ms; the index is not seen
+(what holds the bytes was 1.5 ms a frame to begin with). Frame times in the
+phases 70.1-72.1 ms, within their spread. An ignored test puts a frame's
+6,000 fills at 3.8 ms of the card's time (`fills_on_the_card_cost`,
+measured with another game on the card).
+
+The ranges a submission asks the kernel about alone (some 200 a frame,
+6 ms): about 176 of them lie in 136 reservations a submission, 55 of those
+under 64 MiB, 14 holding two or more: asking per reservation would save at
+most some 40 calls, about 1 ms. Not done.
+
+Checked (diagnostics, `VICTORY_REFRESH_CHECK`, `VICTORY_UPCOPY_CHECK`,
+`VICTORY_FETCH_CHECK` and the new `VICTORY_CARD_STEPS_CHECK`, 300 s, frames
+captured; runs f1Check with f1, f6Check with everything): no device
+removed; no copy stale at rest (51 looks); fetched pieces caught mid-write
+0.5-12 a frame and found whole when fetched again in about the same numbers
+(655 against 653 summed over the frame lines; the launch of the entry above,
+verif2, the code before: 726 against 712); the up-copy check's warnings of
+the same kinds and about the same numbers as verif2. The card steps check:
+in f1Check, 9 of 217 frame lines had 2 of 26-45 fills differ from title
+memory after the landing, always the same 32 bytes; the check now leaves out
+fills whose bytes a later step of their submission writes again, and in
+f6Check all 3,056 compared were as title memory (20 left out that way).
+
+What frame rate is in reach, gameplay, ray tracing on, this machine:
+
+- The card: 50-64 ms of its own work a frame (above). However quick the CPU
+  gets, that is 16-20 fps, and in the launches where it worked longer
+  (queue busy 96%) the frame rate was 11-12. 20-30 fps needs the card's
+  work cut by a third to a half: of ours on it, the fills of card steps
+  (some 4 ms by the test above), the relay's hashes of 12,700 pieces of
+  64 KiB a frame (830 MB read) and its fetches (86 MB a frame on the copy
+  queue), the sends; the rest is the title's passes and the rays.
+- The submitting thread: 50-60 ms of preparing a frame, of which asking the
+  write watch 13-14 (the kernel resets some 11,500 written pages a frame,
+  about 1.4 µs each, one at a time behind the address space's lock), the
+  lists' steps 27 (refreshes 18.5: 10,600 a frame, 9,300 known to copy
+  nothing), copies in the card's memory 8.5, card-step planning 5-7, the
+  title's bytes under flights' writes 5-6. It all follows from finding, at
+  every submission, what the title wrote since the last one, copying it and
+  sending it up: some 45 MB of pages the title writes a frame, 90 MB copied,
+  35 MB sent up, 48 MB landed back. Done as now, the floor is the kernel's
+  part plus one pass over those bytes, some 25-30 ms on one thread (30 fps
+  at the very best), and 20 fps is the realistic ceiling.
+- What it would take to go past that: not to look for changes in memory the
+  card reads in place. The title's 174 MB heap (its ring of constants) and
+  the per-frame buffers opened as host heaps and read by the card where
+  they are (`inplace.rs`; its level 2 is not safe with flights in the air
+  today, because the relay knows shader writes only by declared ranges);
+  the skinning passes' writes told exactly (a bit per 64 KiB written, set by
+  the translated shader) instead of declared over the whole heap, so that
+  neither card steps nor the landing's compare of 174 MB are needed for
+  them; and preparing the next submission on another thread while one is
+  sent.
+
+Launches thrown away: one ended at 37 s in the title's own code (a write to
+0, as the one of the entry above), and two diagnostics launches (f3DiagAB,
+f4Check) stood 275-400 ms a frame in a diagnostic of ours (the reservations
+of the ranges asked about alone: some `VirtualQuery` calls a frame on the
+submitting thread), since taken out again.
