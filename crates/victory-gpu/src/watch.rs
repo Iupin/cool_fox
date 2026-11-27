@@ -59,6 +59,8 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        let newest = self.chunks.entry(page / CHUNK).or_insert(0);
+        *newest = (*newest).max(now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -125,6 +127,9 @@ struct Journal {
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
     parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Of each run of [`CHUNK`] pages (by page / `CHUNK`), the newest asking
+    /// in `written` there ([`nothing_new`]).
+    chunks: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -145,6 +150,7 @@ struct Journal {
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -860,9 +866,45 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    j.nothing_after(first, taken, ranged)
 }
+
+impl Journal {
+    /// Whether no page from `first` on, as many as `taken` has, was written
+    /// after its taking (`taken`, or `ranged` if later; a page never taken
+    /// counts as due unless `ranged` holds it).
+    ///
+    /// By runs of [`CHUNK`] pages: one whose newest write is no newer than
+    /// the oldest taking of its pages holds nothing new, and its pages are
+    /// not looked at one by one (the title's 174 MB heap is 2,700 pages,
+    /// nearly all of them written some time, asked about thousands of times
+    /// a frame: 5 % of the submitting thread, run d0Prof).
+    fn nothing_after(&self, first: usize, taken: &[u64], ranged: u64) -> bool {
+        let last = first + taken.len();
+        if ranged == 0 && taken.iter().any(|&at| at == 0) {
+            return false;
+        }
+        let mut chunk = first / CHUNK;
+        while chunk * CHUNK < last {
+            let (a, b) = ((chunk * CHUNK).max(first), ((chunk + 1) * CHUNK).min(last));
+            chunk += 1;
+            let Some(&newest) = self.chunks.get(&(a / CHUNK)) else {
+                continue;
+            };
+            let least = taken[a - first..b - first].iter().fold(u64::MAX, |m, &t| m.min(t.max(ranged)));
+            if newest <= least {
+                continue;
+            }
+            if !self.written.range(a..b).all(|(&page, &write)| write <= taken[page - first].max(ranged)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Pages to a run of [`Journal::chunks`].
+const CHUNK: usize = 64;
 
 impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
@@ -2964,6 +3006,7 @@ mod parts_tests {
         let mut j = Journal {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
@@ -2984,6 +3027,55 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    /// The look by runs of pages says what a look at every page says, for
+    /// ranges across runs, pages never taken, and a range taken whole.
+    #[test]
+    fn nothing_new_by_runs_is_nothing_new_by_pages() {
+        let mut j = Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            chunks: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        // A small generator, the same every run.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let by_pages = |j: &Journal, first: usize, taken: &[u64], ranged: u64| {
+            (ranged != 0 || taken.iter().all(|&t| t != 0))
+                && j.written.range(first..first + taken.len()).all(|(&p, &w)| w <= taken[p - first].max(ranged))
+        };
+        let mut agreed = [0; 2];
+        for round in 1..=4000u64 {
+            // Writes into some 600 pages, the newer the later.
+            for _ in 0..next(4) {
+                j.note(1000 + next(600) as usize, WHOLE, round);
+            }
+            let first = 1000 + next(500) as usize;
+            let len = 1 + next(200) as usize;
+            // Taken at about now, some pages a little earlier, some never.
+            let taken: Vec<u64> = (0..len)
+                .map(|_| match next(50) {
+                    0 => 0,
+                    1..=5 => round.saturating_sub(next(40)),
+                    _ => round,
+                })
+                .collect();
+            let ranged = if next(10) == 0 { round.saturating_sub(next(5)) } else { 0 };
+            let want = by_pages(&j, first, &taken, ranged);
+            assert_eq!(j.nothing_after(first, &taken, ranged), want, "round {round}");
+            agreed[usize::from(want)] += 1;
+        }
+        // Both answers came up often.
+        assert!(agreed[0] > 100 && agreed[1] > 100, "{agreed:?}");
     }
 }
 

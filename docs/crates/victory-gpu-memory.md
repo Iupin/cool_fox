@@ -186,7 +186,15 @@ deferred refresh:
 1. **`Shadow::nothing_new`** (`shadow.rs:3903`): if the copy is watched or
    guarded, no declared range overlaps, and the journal already says that no
    page was written after `copied`, nothing is done and the kernel is not asked.
-   This is the hot fast path.
+   This is the hot fast path. Since 2026-11-27 the journal keeps, for each
+   run of 64 pages (`CHUNK`), the newest asking that found a page there
+   written (`Journal::chunks`, raised in `Journal::note`, never lowered,
+   as the pages' own entries); `Journal::nothing_after` passes over a run
+   whose newest write is no newer than the oldest taking of its pages, and
+   looks at a run's pages one by one only otherwise. The answer is the same
+   (a unit test compares both on 4,000 random cases); the title's 174 MB
+   heap is 2,700 pages, nearly all written some time, and this check was
+   5 % of the submitting thread (run d0Prof).
 2. **`Shadow::update`** (`shadow.rs:3862`) skips declared ranges and refreshes
    the gaps with `update_free`.
 3. **`update_free`** (`shadow.rs:3939`) calls `watch::writes(from, to, guarded)`.
@@ -1111,7 +1119,7 @@ Do not run them while another build holds the target directory.
 | File | Tests (ignored) | Covers |
 |---|---|---|
 | `watched.rs` | 3 | A write-watched block is zeroed and aligned, the kernel answers for its whole 64 KiB pages (uncommitted ones too), the journal tells its writes to every asker, a `ReadFile` into it is seen. |
-| `watch.rs` | 42 | Refusals remembered until the address space changes, and view memory refused before missing no write (through the other view, twice, and a kernel read). The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
+| `watch.rs` | 43 | The look at the journal by runs of 64 pages answers as page by page does. Refusals remembered until the address space changes, and view memory refused before missing no write (through the other view, twice, and a kernel read). The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
 | `writers.rs` | 12 | The writers watch on memory of the test's own: a write is told with its instruction, offset, size, value and count and is done; a write beside the range is counted only; a string store across two pages; a write through another view; a kernel read (`ReadFile`) refused while watched and landing under `kernel_writing`, told as the kernel's; the guards still report their block written; detail stops while counting goes on; the window arms and disarms; a range mapped after the window opened is watched then; a binding found by a draw is watched; switch parsing. |
 | `shadow.rs` | 34 (1) | The touched list takes a changed card copy once (changed before and after registering, many times). Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |
