@@ -719,24 +719,29 @@ fn lone_reservations(alone: &[usize]) {
         if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
             continue;
         }
-        let e = bases.entry(m.AllocationBase as usize).or_insert((0, 0));
+        let base = m.AllocationBase as usize;
+        let e = bases.entry(base).or_insert((0, 0));
         e.0 += 1;
         if e.1 == 0 {
-            // The reservation's extent: its regions from its base on.
-            let mut end = m.AllocationBase as usize;
-            loop {
-                // SAFETY: as above.
-                let mut r: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-                // SAFETY: as above.
-                if unsafe { VirtualQuery(end as *const _, &mut r, size_of_val(&r)) } == 0 || r.AllocationBase != m.AllocationBase {
-                    break;
+            e.1 = *LONE_EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).entry(base).or_insert_with(|| {
+                // The reservation's extent: its regions from its base on, at
+                // most 64 of them (the title's own reservations have
+                // thousands: walking them whole stood 400 ms a frame).
+                let mut end = base;
+                for _ in 0..64 {
+                    // SAFETY: as above.
+                    let mut r: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: as above.
+                    if unsafe { VirtualQuery(end as *const _, &mut r, size_of_val(&r)) } == 0 || r.AllocationBase as usize != base {
+                        return end - base;
+                    }
+                    end = r.BaseAddress as usize + r.RegionSize;
+                    if end - base >= 64 << 20 {
+                        break;
+                    }
                 }
-                end = r.BaseAddress as usize + r.RegionSize;
-                if end - m.AllocationBase as usize >= 64 << 20 {
-                    break;
-                }
-            }
-            e.1 = end - m.AllocationBase as usize;
+                usize::MAX
+            });
         }
     }
     LONE[0].fetch_add(alone.len() as u64, Relaxed);
@@ -745,9 +750,15 @@ fn lone_reservations(alone: &[usize]) {
     LONE[3].fetch_add(bases.values().filter(|e| e.0 >= 2).count() as u64, Relaxed);
 }
 
+/// The extents of the reservations [`lone_reservations`] found, until the
+/// next frame line (`usize::MAX`: 64 MiB or more, or too many regions).
+#[cfg(feature = "diagnostics")]
+static LONE_EXTENTS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
 /// [`LONE`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn lone_asks() -> [u64; 4] {
+    LONE_EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     [0, 1, 2, 3].map(|i| LONE[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
