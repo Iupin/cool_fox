@@ -881,7 +881,7 @@ impl Journal {
     /// a frame: 5 % of the submitting thread, run d0Prof).
     fn nothing_after(&self, first: usize, taken: &[u64], ranged: u64) -> bool {
         let last = first + taken.len();
-        if ranged == 0 && taken.iter().any(|&at| at == 0) {
+        if ranged == 0 && taken.contains(&0) {
             return false;
         }
         let mut chunk = first / CHUNK;
