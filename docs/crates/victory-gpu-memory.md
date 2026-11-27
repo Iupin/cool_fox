@@ -226,6 +226,24 @@ for all of a submission's ranges that lie within 8 MiB of each other. With
 `VICTORY_ASK_EARLY`, the thread `victory-ask-early` asks hot pieces in advance
 while the title records.
 
+Refusals remembered (2026-11-27, `VICTORY_ASK_REFUSED`, on): a call the
+kernel refuses (the range is not write-watched memory of one reservation)
+costs about what an answer does, 25 µs and more whatever the range, and two
+in three of a frame's ~540 askings were refused, the same ranges every frame:
+view memory (guarded instead), runs of a submission's ranges across two
+reservations (then asked by halves, `ask_run`), memory that is not watched.
+`kernel_written` keeps the exact page ranges refused (`REFUSALS`) and does not
+ask about them again while `REFUSAL_EPOCH` is unchanged and for at most a
+second. The epoch moves at every change of the address space we are told of
+(`address_space_changed`: `title_memory_allocated`, `_freed`, `_remapping`,
+`_remapped`, `_unmapping`, `_splitting`, `views_mapped`, and
+`watched::alloc`/`free`); a refusal noted by a call during which it moved is
+not kept. Why nothing is lost: a remembered refusal makes the caller do what
+a refusal does (ask by halves, ask the guards, copy whole), and a call that
+fails resets no kernel bit, so memory that became write-watched since keeps
+its bits until it is asked again. The diagnostics line `askings the kernel
+refused per frame` counts refusals by caller and those not asked again.
+
 ### 3.4 Write faults: the guard handler
 
 `watch::install` (`watch.rs:2559`) registers a first-chance vectored handler,
@@ -902,6 +920,7 @@ launcher sets, with the value it sets.
 | `VICTORY_WATCHED_HEAP` | watched.rs `on` | on | Blocks of 64 KiB or more of host memory handed to the title (its allocator's, device heaps) are write-watched reservations (§3.3); `0`: the process heap, copied whole at every refresh. |
 | `VICTORY_TAKE_PARTS` | watch.rs:787 | on | Re-take only the parts written. |
 | `VICTORY_ASK_ONCE` | watch.rs:524 | on | One write-watch asking per submission. |
+| `VICTORY_ASK_REFUSED` | watch.rs `ask_refused_again` | on (remembered) | `0`: ask the kernel again about ranges it refused, every time, as before 2026-11-27 (§3.3). `VICTORY_AB`-switchable. |
 | `VICTORY_ASK_EARLY` | watch.rs:403 | unset = off; a value = every N ms (2 if it does not parse) | Asks while the title records. |
 | `VICTORY_PAGE_WRITES` | watch.rs:2116 | `guards` (bit 1) | What to do with DirectStorage page writes: `0`, `1`, `slots`, `all`. |
 | `VICTORY_SAFE_COPY` | safecopy.rs:325 | on | `rep movsb` with fault recovery instead of kernel copies. Also installs the handler. |
@@ -1080,7 +1099,8 @@ Do not run them while another build holds the target directory.
 
 | File | Tests (ignored) | Covers |
 |---|---|---|
-| `watch.rs` | 40 | The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
+| `watched.rs` | 3 | A write-watched block is zeroed and aligned, the kernel answers for its whole 64 KiB pages (uncommitted ones too), the journal tells its writes to every asker, a `ReadFile` into it is seen. |
+| `watch.rs` | 42 | Refusals remembered until the address space changes, and view memory refused before missing no write (through the other view, twice, and a kernel read). The journal is shared by askers. Kernel reads into guarded blocks, and kept past their call. Views and aliases (`a_write_through_another_view_is_reported_at_the_guarded_one`). Rest. Holes. Remap races (`no_write_is_lost_between_askers`, `no_mapping_is_lost_between_askers`). |
 | `writers.rs` | 12 | The writers watch on memory of the test's own: a write is told with its instruction, offset, size, value and count and is done; a write beside the range is counted only; a string store across two pages; a write through another view; a kernel read (`ReadFile`) refused while watched and landing under `kernel_writing`, told as the kernel's; the guards still report their block written; detail stops while counting goes on; the window arms and disarms; a range mapped after the window opened is watched then; a binding found by a draw is watched; switch parsing. |
 | `shadow.rs` | 33 (1) | Card piece arithmetic against `CARD_COMPARE`. `Flights`. `merge_piece`. Dword runs. Landings against title bytes. `card_limits`. Windows. |
 | `land/tests.rs` | 8 (1) | Pool order and panics, merges, landing beside, waits for remaps. |

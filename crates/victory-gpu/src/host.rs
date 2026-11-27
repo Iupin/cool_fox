@@ -7580,6 +7580,25 @@ fn split_line(frames: f64) {
         s[2] / 1048576.0,
         s[3],
     );
+    let r: Vec<f64> = crate::watch::refusals().iter().map(|&n| n as f64 / frames).collect();
+    tracing::info!(
+        "askings the kernel refused per frame: {:.0} runs of a submission's ranges ({:.2} ms), {:.0} of its ranges alone ({:.2} ms), \
+         {:.0} of refreshes ({:.2} ms); {:.0} not asked again, refused before (VICTORY_ASK_REFUSED=0 asks them); answered: {:.0} runs \
+         ({:.2} ms), {:.0} ranges alone ({:.2} ms), {:.0} of refreshes ({:.2} ms)",
+        r[0],
+        r[1] / 1e6,
+        r[2],
+        r[3] / 1e6,
+        r[4],
+        r[5] / 1e6,
+        r[6],
+        r[7],
+        r[8] / 1e6,
+        r[9],
+        r[10] / 1e6,
+        r[11],
+        r[12] / 1e6,
+    );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
          first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",

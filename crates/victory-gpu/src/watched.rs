@@ -88,6 +88,8 @@ pub fn alloc(size: usize, align: usize) -> Option<NonNull<u8>> {
     }
     // SAFETY: the first word of the committed page below the caller's bytes.
     unsafe { (commit as *mut usize).write(base) };
+    // (A range the kernel refused here before is write-watched now.)
+    crate::watch::address_space_changed();
     NonNull::new(user as *mut u8)
 }
 
@@ -100,6 +102,7 @@ pub unsafe fn free(user: *mut u8) {
     let base = unsafe { ((user as usize - KERNEL_PAGE) as *const usize).read() };
     // SAFETY: the whole reservation, ours.
     unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    crate::watch::address_space_changed();
 }
 
 #[cfg(test)]

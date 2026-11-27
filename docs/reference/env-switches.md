@@ -578,12 +578,13 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_UPLOAD_LOW` | `crates/victory-gpu/src/upload.rs:42` | true unless `0` | `VICTORY_UPLOAD_LOW=0`: from the process heap, as before. | neither |
 
-### victory-gpu / watch (12)
+### victory-gpu / watch (13)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
 | `VICTORY_ASK_EARLY` | `crates/victory-gpu/src/watch.rs:403` | f64; default `2.0` | Whether a thread asks, between a submission's askings, about the memory they found written (`VICTORY_ASK_EARLY=<ms>` between its rounds; off unless given: in run cpu-2 the submissions' own askings were none the cheaper for its ... | neither |
 | `VICTORY_ASK_ONCE` | `crates/victory-gpu/src/watch.rs:524` | true unless `0` | `VICTORY_ASK_ONCE=0` asks per range, as before. | neither |
+| `VICTORY_ASK_REFUSED` | `crates/victory-gpu/src/watch.rs` `ask_refused_again` | default ON (refusals remembered); `0` off; `VICTORY_AB`-switchable | Whether a range the kernel refused to answer for is not asked about again until the address space changes (`VICTORY_ASK_REFUSED=0`: every time, as before 2026-11-27). | neither |
 | `VICTORY_GUARD_ASK` | `crates/victory-gpu/src/watch.rs:1646` | true only if `1` | `VICTORY_GUARD_ASK=1` asks every time, as before. | neither |
 | `VICTORY_GUARD_HOLES` | `crates/victory-gpu/src/watch.rs:1762` | true unless `0` | `VICTORY_GUARD_HOLES=0` looks at the first address only, as before. | neither |
 | `VICTORY_GUARD_REST` | `crates/victory-gpu/src/watch.rs:1348`, `crates/victory-gpu/src/watch.rs:1352` | default ON; `0` off | How long a block the title has just opened by a write is left open by those that take it (`VICTORY_GUARD_REST=<microseconds>`, 3,000 unless given; | neither |
