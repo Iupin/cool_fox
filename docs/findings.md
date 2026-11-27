@@ -293,3 +293,10 @@ them.
 The cinematic (30-72 s) is dominated by loading stalls and says little:
 preparing 96-193 ms before (four launches), 110-167 after (four; one of
 them with a build of ours running beside it).
+
+`VICTORY_RELOOK_MS=20000` (one diagnostics launch against one at the default
+4,000): the heap pass's "looking at slots" 21.9 → 15.4 ms a frame in the
+cinematic and 17.1 → 13.8 in gameplay, beside the recording, not on the
+submitting thread; warnings of a texture picked by index that changed with
+nothing to tell of it 215 → 212. One launch each is within the spread
+between launches, so the default stays 4,000.
