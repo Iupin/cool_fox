@@ -161,26 +161,36 @@ enum F16Scope {
     Images(Vec<String>),
 }
 
-/// `VICTORY_F16_NEAREST`: unset, empty or `0` none (the default: the host's
-/// conversion everywhere), `1` every program, else a comma list of image
-/// file names and program hashes. The candidate for a default is
-/// `amd_fidelityfx_upscaler_xbox.dll` (AMD's FidelityFX upscaler for Xbox,
-/// middleware a title ships beside its executable): its accumulate pass
-/// computes its network's inputs in 16 bits and with the host's rounding
-/// toward zero its history ran away (the hotspot). With that scope no launch
-/// of 7 had the hotspot, but 2 of the 7 were posterised (with the host's
-/// rounding: hotspot 4 of 5, posterised 5 of 5), so it is not the default
-/// yet (`docs/bug-journal.md` 2026-11-27).
+/// The scope when `VICTORY_F16_NEAREST` is unset or empty: AMD's FidelityFX
+/// upscaler for Xbox, middleware a title ships beside its executable under
+/// this file name (not the title's own code). Its accumulate pass computes
+/// its network's inputs in 16 bits, and with the host's rounding toward zero
+/// its history ran away (the hotspot).
+const DEFAULT_F16_SCOPE: &str = "amd_fidelityfx_upscaler_xbox.dll";
+
+/// `VICTORY_F16_NEAREST`: unset or empty [`DEFAULT_F16_SCOPE`] (the
+/// default), `0` none (the host's conversion everywhere), `1` every program,
+/// else a comma list of image file names and program hashes. With the
+/// upscaler's scope no launch of 11 had the hotspot; with the host's rounding
+/// 7 of 9 had it. Posterisation was no more frequent with the scope (2 of 11
+/// against 5 of 9, the 5 in a batch run at another time; strictly
+/// alternated, 0 of 4 each) (`docs/bug-journal.md` 2026-11-27).
 fn f16_scope(value: Option<&str>) -> F16Scope {
-    match value.map(str::trim) {
-        Some("1") => F16Scope::All,
-        Some(list) if !list.is_empty() && list != "0" => F16Scope::Images(
+    let value = value.map(str::trim).unwrap_or("");
+    let list = if value.is_empty() {
+        DEFAULT_F16_SCOPE
+    } else {
+        value
+    };
+    match list {
+        "1" => F16Scope::All,
+        "0" => F16Scope::None,
+        list => F16Scope::Images(
             list.split(',')
                 .map(|name| name.trim().to_ascii_lowercase())
                 .filter(|name| !name.is_empty())
                 .collect(),
         ),
-        _ => F16Scope::None,
     }
 }
 
@@ -587,9 +597,20 @@ mod tests {
     fn the_console_f16_scope_is_the_images_and_programs_the_switch_names() {
         const P: &str = "0123456789abcdef";
         let upscaler = Some("AMD_FidelityFX_Upscaler_Xbox.dll");
-        // Unset, empty or `0`: nowhere; `1`: everywhere, which the
-        // translator does on its own.
-        for value in [None, Some(""), Some("  "), Some("0"), Some("1")] {
+        // Unset or empty: the upscaler's image, and only it.
+        for value in [None, Some(""), Some("  ")] {
+            let scope = f16_scope(value);
+            assert!(in_f16_scope(&scope, upscaler, P), "{value:?}");
+            assert!(
+                !in_f16_scope(&scope, Some("game_scarlett_master.exe"), P),
+                "{value:?}"
+            );
+            assert!(!in_f16_scope(&scope, None, P), "{value:?}");
+        }
+        // `0`: nowhere; `1`: everywhere, which the translator does on its own.
+        assert_eq!(f16_scope(Some("0")), F16Scope::None);
+        assert_eq!(f16_scope(Some(" 0 ")), F16Scope::None);
+        for value in [Some("0"), Some("1")] {
             assert!(!in_f16_scope(&f16_scope(value), upscaler, P), "{value:?}");
         }
         let scope = f16_scope(Some("amd_fidelityfx_upscaler_xbox.dll"));

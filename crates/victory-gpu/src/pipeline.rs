@@ -63,7 +63,7 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     /// Its 16-bit float results rounded as the console rounds them
     /// (`shader_cache::console_f16_for`: the title passed it from an image
-    /// `VICTORY_F16_NEAREST` names, e.g. AMD's upscaler; none by default).
+    /// `VICTORY_F16_NEAREST` names; AMD's upscaler by default).
     console_f16: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]

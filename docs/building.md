@@ -180,6 +180,14 @@ cargo fmt --all -- --check       # not in CI (see below)
   clippy commands pass; `cargo test --workspace --locked` passes with no
   game on the card (998 passed, 46 ignored; `victory-gpu` 387,
   `victory-shader` 290, `victory-hle` 158); policy passes (271 files).
+- **2026-11-27 (the upscaler's 16-bit scope made the default):** both
+  clippy commands pass; `cargo test -p victory-gpu --locked` 387 passed, 35
+  ignored (one earlier run, the first after a series of game launches, ended
+  in `STATUS_STACK_BUFFER_OVERRUN` with five card tests failed in `resource`
+  and `ambient`; the next two runs passed unchanged); `cargo test -p
+  victory-shader --locked f16` 14 passed; policy passes (271 files). The
+  full workspace run was not repeated. `shader_cache.rs` keeps two rustfmt
+  differences it had before.
 
 How it got there, from a tree where `f4b48ad` itself fails CI (37 / 36
 clippy lints; 2 failing `victory-gpu` tests):

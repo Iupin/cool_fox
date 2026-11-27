@@ -71,24 +71,30 @@ and the crate documents under [docs/crates](docs/crates):
 - **Ray tracing is on by default** (`VICTORY_BVH_BUILDER=0` or
   `scripts\play.ps1 -NoRayTracing` turns it off). With it off, 32 launches of
   47 were posterised for the whole session: smooth shading collapsed to a few
-  levels in each colour channel. With it on, none of 9. That was taken as the
-  fix without a longer run of launches. How leaving it out causes the fault,
-  and why a third of such launches were right all the same, is not known;
-  `docs/bug-journal.md` (2026-11-26) has what was ruled out and how to take
-  the search up again.
+  levels in each colour channel. With it on, none of 9 at first; that was
+  taken as the fix without a longer run of launches, and it was not the whole
+  story: on 2026-11-27, with ray tracing on, 10 of 16 launches between 00:36
+  and 05:00 were posterised again (below). How leaving it out causes the
+  fault, and why a third of such launches were right all the same, is not
+  known; `docs/bug-journal.md` (2026-11-26 and 2026-11-27) has what was ruled
+  out and how to take the search up again.
+- **No more hotspot on the player's hair.** About 450 frames into the first
+  scene a bright spot grew from the hair until the picture was white (7 of 9
+  launches). The cause was 16-bit float rounding in AMD's upscaler, which the
+  title ships as `amd_fidelityfx_upscaler_xbox.dll`: the host rounds toward
+  zero, the console to nearest. That file's programs now round as the console
+  does by default (0 of 11 launches with the hotspot; `VICTORY_F16_NEAREST=0`
+  brings the host's rounding back).
 
 Known here and not solved:
 
 - Some characters' skin is black in some launches, with or without the fault
   above (perhaps textures that arrive late; not looked into).
-- **A bright hotspot grows from the player's hair** about 450 frames into the
-  first scene until the picture is white (4 launches of 5 on 2026-11-27). The
-  cause is 16-bit float rounding in the title's AMD upscaler;
-  `VICTORY_F16_NEAREST=amd_fidelityfx_upscaler_xbox.dll` removed it in 7
-  launches of 7, but is not the default yet.
-- **Posterisation is back**: since about 00:30 on 2026-11-27, 10 of 16
-  launches were posterised for the whole session again, with ray tracing on
-  and whatever the rounding (`docs/bug-journal.md`, 2026-11-27).
+- **Posterisation comes and goes and its cause is not known**: on
+  2026-11-27, 15 launches up to 00:05 were clean; 10 of 16 between 00:36 and
+  05:00 were posterised for the whole session, whatever the 16-bit rounding;
+  then 8 strictly alternated launches on an idle machine (05:22-06:09) were
+  all clean (`docs/bug-journal.md`, 2026-11-27).
 - **The frame is bound by the CPU**: about 66 ms of 100 is the layer
   preparing submissions.
 - More is wrong in the open world; it has not been written down yet.
