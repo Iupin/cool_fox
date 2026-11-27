@@ -488,6 +488,23 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] for many, under one lock.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.extend(objects.into_iter().map(|object| (started, Retired::Resource(object))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -5678,9 +5695,10 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST. Buffers
+        // decay to COMMON between ExecuteCommandLists calls, so submit
+        // the compare separately before signalling this submission's fence.
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -5718,6 +5736,9 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -5772,6 +5793,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5791,8 +5815,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
-            // With timing on each group is one of `runs` (and the compare
-            // of copies in the card's memory, with the last): every
+            // With timing on each group is one of `runs`: every
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
             if timing() {
@@ -7579,6 +7602,25 @@ fn split_line(frames: f64) {
         s[1] / 1048576.0,
         s[2] / 1048576.0,
         s[3],
+    );
+    let r: Vec<f64> = crate::watch::refusals().iter().map(|&n| n as f64 / frames).collect();
+    tracing::info!(
+        "askings the kernel refused per frame: {:.0} runs of a submission's ranges ({:.2} ms), {:.0} of its ranges alone ({:.2} ms), \
+         {:.0} of refreshes ({:.2} ms); {:.0} not asked again, refused before (VICTORY_ASK_REFUSED=0 asks them); answered: {:.0} runs \
+         ({:.2} ms), {:.0} ranges alone ({:.2} ms), {:.0} of refreshes ({:.2} ms)",
+        r[0],
+        r[1] / 1e6,
+        r[2],
+        r[3] / 1e6,
+        r[4],
+        r[5] / 1e6,
+        r[6],
+        r[7],
+        r[8] / 1e6,
+        r[9],
+        r[10] / 1e6,
+        r[11],
+        r[12] / 1e6,
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \

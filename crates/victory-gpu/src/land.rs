@@ -339,6 +339,20 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     .each(count, f);
 }
 
+/// [`Pool::each`] on threads kept for the slots of the steps done on the card
+/// (`crate::host::card_steps`; `VICTORY_STEPS_THREADS`, 4 with this one). On
+/// the threads for the title's bytes under flights' writes they waited for a
+/// landing's batch there to end: a pool does one batch at a time (run
+/// f1Diag1: 5 ms a frame, most of the 5.4 the slots took).
+pub(crate) fn each_steps(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VICTORY_STEPS_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4usize);
+        Pool::new("victory-steps", threads.clamp(1, 16))
+    })
+    .each(count, f);
+}
+
 /// Calls `f` with every number below `count`, on this thread and on threads
 /// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
 /// on this one alone). Those for `records`, the heaps' records copied as

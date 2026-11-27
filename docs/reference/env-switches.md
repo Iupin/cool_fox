@@ -9,10 +9,10 @@ explained in a comment where it is read, and this page quotes that comment.
 
 | set | count | how |
 |---|---:|---|
-| distinct `VICTORY_*` names anywhere in tracked files | **354** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
-| distinct names in `.rs` files (code and comments) | 353 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
-| distinct names as a string literal `"VICTORY_..."` in `.rs` | 352 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
-| **read by product code** (tables below) | **322** | literal outside test modules/files, not only a `.env()` set or `==` compare |
+| distinct `VICTORY_*` names anywhere in tracked files | **361** | `git grep -ohE 'VICTORY_[A-Z0-9_]+' \| sort -u \| wc -l` |
+| distinct names in `.rs` files (code and comments) | 357 | `git grep -ohE 'VICTORY_[A-Z0-9_]+' -- '*.rs' \| sort -u \| wc -l` |
+| distinct names as a string literal `"VICTORY_..."` in `.rs` | 356 | `git grep -ohE '"VICTORY_[A-Z0-9_]+"' -- '*.rs' \| sort -u \| wc -l` |
+| **read by product code** (tables below) | **326** | literal outside test modules/files, not only a `.env()` set or `==` compare |
 | of those, build-time `env!` values (not user settings) | 3 | `VICTORY_TRANSLATOR`, `VICTORY_SHADER_SOURCE_HASH`, `VICTORY_SHADER_SWITCHES` |
 | of those, set by `victory` itself for its own child processes | 2 | `VICTORY_AUDIO_CAPTURE_OF`, `VICTORY_RELAUNCHED_FROM` |
 | read only by tests / benchmarks / test child processes | 30 | [Test-only](#test-only-and-child-process-names) |
@@ -26,7 +26,13 @@ explained in a comment where it is read, and this page quotes that comment.
 classification; `crates/victory-gpu/src/writers.rs` counts once it is
 tracked. `VICTORY_MEMORY_FAULT_MB`, added later that day, is not counted
 either, nor are `VICTORY_EARLY_DEPTH`, `VICTORY_DUMP_ONLY` and
-`VICTORY_DUMP_RAW`, added after it.)
+`VICTORY_DUMP_RAW`, added after it. The first three rows were recounted on
+2026-11-27, after `VICTORY_WATCHED_HEAP`, `VICTORY_ASK_REFUSED`,
+`VICTORY_CARD_TOUCHED` and `VICTORY_RELOOK_MS` were added; "read by product
+code" is the old count plus those four, not reclassified.
+`VICTORY_PLACED_FORWARD`, `VICTORY_CARD_STEPS_CHECK`, `VICTORY_HOLDER_INDEX`,
+`VICTORY_SLOTS_APART` and `VICTORY_STEPS_THREADS` were added later that day
+and are not counted in the rows above.)
 
 How the tables were made (re-run to re-verify): every `"VICTORY_[A-Z0-9_]+"`
 literal in `git ls-files '*.rs'` was classified as a test site if it lies inside
@@ -253,7 +259,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_VIEW_EXTENT` | `crates/victory-gpu/src/descriptor/host.rs:3603` | true unless `0` | `VICTORY_VIEW_EXTENT=0` looks the copy up by the view's range alone, as before. | neither |
 | `VICTORY_VIEW_INLINE` | `crates/victory-gpu/src/descriptor.rs:897` | true unless `0` | `VICTORY_VIEW_INLINE=0` makes every view a table entry, as before. | neither |
 
-### victory-gpu / draw (25)
+### victory-gpu / draw (26)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -278,6 +284,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_SCISSOR_TEST` | `crates/victory-gpu/src/draw.rs:524` | only `full` | An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`): they are all widened to the whole target. | neither |
 | `VICTORY_TEXTURE_CATCHUP` | `crates/victory-gpu/src/draw.rs:2635` | true unless `0` | `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. | neither |
 | `VICTORY_TEXTURE_STAGE_MB` | `crates/victory-gpu/src/draw.rs:2522` | u64 | `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of textures (a scene's first minutes) then drains in fewer frames. | neither |
+| `VICTORY_RELOOK_MS` | `crates/victory-gpu/src/draw.rs` (heap texture pass) | ms; default `4000` | How long a slot of a texture picked by index with nothing to upload waits at most for its next look, in frames (between 16 and the larger of 256 and the value / 16). Longer means fewer looks and a texture the title changes with nothing to tell of it seen later. After rorodev6/victory-nvidia-megafork 77e13a9 (trustno1-coder), where it is 20,000. | neither |
 | `VICTORY_TEXTURE_STAGE_MS` | `crates/victory-gpu/src/draw.rs:2629` | number; default `250` | Also within a time per pass: the pass runs on a thread that records the frame, and making and staging 192 MB of textures took 1.6-2.2 s of each of the world's first twenty frames (run 20). | neither |
 | `VICTORY_THREAD_DIMENSIONS` | `crates/victory-gpu/src/draw.rs:4404` | true unless `0` | `VICTORY_THREAD_DIMENSIONS=0`: such counts are taken for groups, as before. | neither |
 | `VICTORY_UNWATCHED_FRAMES` | `crates/victory-gpu/src/draw.rs:996` | number; default `1` | Memory that is not write-watched is copied whole by every refresh. | neither |
@@ -302,7 +309,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_LATE_WAITS` | `crates/victory-gpu/src/frame.rs:144` | true only if `1` | `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before. | neither |
 
-### victory-gpu / host (47)
+### victory-gpu / host (51)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -335,6 +342,10 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_LAZY_PRELUDE` | `crates/victory-gpu/src/host.rs:1225` | true unless `0` | `VICTORY_LAZY_PRELUDE=0`: made with the list, as before. | neither |
 | `VICTORY_PANEL` | `crates/victory-gpu/src/host/panel.rs:39` | on if set and not `0` | The texts are put into one of these in turn: the card reads the others, at most half a second old. | neither |
 | `VICTORY_PLACED_ORDER` | `crates/victory-gpu/src/host/card_steps.rs:99`, `crates/victory-gpu/src/host/card_steps.rs:103` | on if set and not `0`; diag build; `VICTORY_AB`-switchable | Whether a copy at its place in a list ([`place`]) is only in the way of what is done on the card in front of the lists if that stands behind it in them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a submission ... | neither |
+| `VICTORY_PLACED_FORWARD` | `crates/victory-gpu/src/host/card_steps.rs` `placed_forward` | true unless `0` | Whether a fill behind a copy at its place in a list that reads only bytes the copy writes is done on the card from the copy's source (`VICTORY_PLACED_FORWARD=0`: refused, the submission waits), and a copy at its place is in the way only of what stands behind it, as with `VICTORY_PLACED_ORDER=1` (without its cut). | neither |
+| `VICTORY_CARD_STEPS_CHECK` | `crates/victory-gpu/src/host/card_steps.rs` `check` | true only if `1` | Diagnostics, not for timed runs: the bytes each fill read through a copy at its place was given are read back and compared with title memory there when the submission has landed. | neither |
+| `VICTORY_HOLDER_INDEX` | `crates/victory-gpu/src/host/card_steps.rs` `holder_index` | true unless `0`; diag build; `VICTORY_AB`-switchable | What writers write, by pieces of title memory: [`holder`] looks there instead of at every writer (`VICTORY_HOLDER_INDEX=0`: every writer for every fill, as before). | neither |
+| `VICTORY_SLOTS_APART` | `crates/victory-gpu/src/host/card_steps.rs` `slots_apart` | true unless `0`; diag build; `VICTORY_AB`-switchable | Whether the slots of fills done on the card are made on threads of their own, each thread's slots' old resources retired under one lock (`VICTORY_SLOTS_APART=0`: on the threads for the title's bytes under flights' writes, one lock each, as before). | neither |
 | `VICTORY_REFRESH_AHEAD` | `crates/victory-gpu/src/host.rs:7679` | true unless `0` | Whether the copies that a submission's shaders write are brought up to date together, on several threads, ahead of its steps (`VICTORY_REFRESH_AHEAD=0`: each before the step that gives it to them). 580 copies a frame, one ... | neither |
 | `VICTORY_REFRESH_FRONT` | `crates/victory-gpu/src/host.rs:7698` | on if set and not `0` | Whether everything a submission refreshes is brought up to date in one go, on several threads, ahead of its steps (`VICTORY_REFRESH_FRONT=1`, and with `VICTORY_JOIN_PARTS`, which needs it; else in groups where the steps ask ... | neither |
 | `VICTORY_RELAY` | `crates/victory-gpu/src/host.rs:2484`, `crates/victory-gpu/src/shadow.rs:1107` | unset or `2`: stage 2; `1`: stage 1 (when the relay is on) | Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default since the walls of the first room were found drawn in every run with this set and in fewer than half without it). | play.ps1=`2`; cmd=`2` |
@@ -370,7 +381,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_INPLACE_PROBE` | `crates/victory-gpu/src/inplace.rs:62` | number; default `0` | `VICTORY_INPLACE_PROBE`: 0 (unset) nothing; 1 the probe on memory of its own at the first sweep, and the census 30 and 150 seconds later; 2 also opens one part of the title's own memory for a moment at the first census. | neither |
 | `VICTORY_INPLACE_PROBE_MB` | `crates/victory-gpu/src/inplace.rs:1236` | number; default `64usize` | module: | neither |
 
-### victory-gpu / land (8)
+### victory-gpu / land (9)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -380,6 +391,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_LAND_SKIP` | `crates/victory-gpu/src/land.rs:69` | true only if `1` | `VICTORY_LAND_SKIP=1`, off by default: counted either way). | neither |
 | `VICTORY_LAND_TAKEN` | `crates/victory-gpu/src/land.rs:511` | true unless `0` | Whether a copy a landing went through is noted as up to date with it (`VICTORY_LAND_TAKEN=0`: it is not, and the next refresh copies the 64 KiB again and sends them up to the card, as before). | neither |
 | `VICTORY_LAND_THREADS` | `crates/victory-gpu/src/land.rs:54` | number | How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`). | neither |
+| `VICTORY_STEPS_THREADS` | `crates/victory-gpu/src/land.rs` `each_steps` | number; default 4 | Threads kept for the slots of the steps done on the card, with the calling one. | neither |
 | `VICTORY_UNDER_THREADS` | `crates/victory-gpu/src/land.rs:336` | number; default `6usize` | [`Pool::each`] on threads kept for the title's bytes under flights' writes (`VICTORY_UNDER_THREADS`, 6 with this one). | neither |
 | `VICTORY_VIEW_THREADS` | `crates/victory-gpu/src/land.rs:351` | number | Calls `f` with every number below `count`, on this thread and on threads kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1: on this one alone). | neither |
 
@@ -502,7 +514,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_TRANSLATOR` | `crates/victory-gpu/src/shader_cache.rs:57` | build-time (`cargo:rustc-env`, victory-gpu/build.rs:44) | BLAKE3 of victory-shader sources, `shader_cache.rs`, `Cargo.lock`, `rust-toolchain.toml`: part of every shader-cache key. | neither |
 
-### victory-gpu / shadow (24)
+### victory-gpu / shadow (25)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
@@ -512,6 +524,7 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_CARD_BUFFERS_MIN_KB` | `crates/victory-gpu/src/shadow.rs:300` | u64; unset | `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the least size in KiB, so that it can go under 1 MiB: 64 is every title buffer. Under the default cap of a ≤ 12 GiB budget, copies under the tier's least size (16 MiB) share at most 3/4 of the cap. | cmd=`64` |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | `crates/victory-gpu/src/shadow.rs:291` | MiB; default derived (`resolve_card_limits`): 16 at ≤ 12 GiB, 4 below 20 GiB, 1 above | Least size of a title buffer that gets a card-memory copy (see also `_MIN_KB`). | neither |
 | `VICTORY_CARD_HASH_LEN` | `crates/victory-gpu/src/shadow.rs:4437` | true unless `0` | `VICTORY_CARD_HASH_LEN=0`: the whole buffer. | neither |
+| `VICTORY_CARD_TOUCHED` | `crates/victory-gpu/src/shadow.rs` `touched_list` | default ON; `0` off; `VICTORY_AB`-switchable | Of the copies in the card's memory, the ones whose CPU side changed since `card_dirty` last took them are kept in a list (`VICTORY_CARD_TOUCHED=0`: every submission looks at all of them, as before 2026-11-27). | neither |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | `crates/victory-gpu/src/shadow.rs:415` | true unless `0` (default ON; the comment above still says off by default: stale) | Whether the texture queue leaves room on the card for card copies of title buffers not made yet. | neither |
 | `VICTORY_CARD_WINDOWS_MB` | `crates/victory-gpu/src/shadow.rs:635` | u64; default `0` | The most bytes of windows outside buffers whose copies go to the card's memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none). | neither |
 | `VICTORY_EXACT_BACK` | `crates/victory-gpu/src/shadow.rs:2267` | true unless `0` | Whether what shaders wrote goes into title memory run by run ([`put_changed`]; on by default, `VICTORY_EXACT_BACK=0` writes the whole stretch from the first changed byte to the last, as before). | neither |
@@ -583,12 +596,13 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 |---|---|---|---|---|
 | `VICTORY_UPLOAD_LOW` | `crates/victory-gpu/src/upload.rs:42` | true unless `0` | `VICTORY_UPLOAD_LOW=0`: from the process heap, as before. | neither |
 
-### victory-gpu / watch (12)
+### victory-gpu / watch (13)
 
 | name | where read | values & default | effect (from the read-site comment) | launcher |
 |---|---|---|---|---|
 | `VICTORY_ASK_EARLY` | `crates/victory-gpu/src/watch.rs:403` | f64; default `2.0` | Whether a thread asks, between a submission's askings, about the memory they found written (`VICTORY_ASK_EARLY=<ms>` between its rounds; off unless given: in run cpu-2 the submissions' own askings were none the cheaper for its ... | neither |
 | `VICTORY_ASK_ONCE` | `crates/victory-gpu/src/watch.rs:524` | true unless `0` | `VICTORY_ASK_ONCE=0` asks per range, as before. | neither |
+| `VICTORY_ASK_REFUSED` | `crates/victory-gpu/src/watch.rs` `ask_refused_again` | default ON (refusals remembered); `0` off; `VICTORY_AB`-switchable | Whether a range the kernel refused to answer for is not asked about again until the address space changes (`VICTORY_ASK_REFUSED=0`: every time, as before 2026-11-27). | neither |
 | `VICTORY_GUARD_ASK` | `crates/victory-gpu/src/watch.rs:1646` | true only if `1` | `VICTORY_GUARD_ASK=1` asks every time, as before. | neither |
 | `VICTORY_GUARD_HOLES` | `crates/victory-gpu/src/watch.rs:1762` | true unless `0` | `VICTORY_GUARD_HOLES=0` looks at the first address only, as before. | neither |
 | `VICTORY_GUARD_REST` | `crates/victory-gpu/src/watch.rs:1348`, `crates/victory-gpu/src/watch.rs:1352` | default ON; `0` off | How long a block the title has just opened by a write is left open by those that take it (`VICTORY_GUARD_REST=<microseconds>`, 3,000 unless given; | neither |
@@ -599,6 +613,12 @@ Launcher column: `play.ps1=` / `cmd=` value set by `scripts/play.ps1` /
 | `VICTORY_PAGE_WRITES` | `crates/victory-gpu/src/watch.rs:2116` | one of `0`, `1`, `slots`; else default arm | What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do not see once its bytes are there ([`title_memory_written`]), as bits: 1, the guarded blocks under it are opened and count as written (host copies of buffers ... | neither |
 | `VICTORY_TAKE_PARTS` | `crates/victory-gpu/src/watch.rs:787` | default ON; `0` off | Of a page taken before, the parts written since, where they are known (`VICTORY_TAKE_PARTS=0`: the page). | neither |
 | `VICTORY_VIEW_GUARD` | `crates/victory-gpu/src/watch.rs:1809` | true unless `0` | Whether all the views of a guarded page are guarded together (`VICTORY_VIEW_GUARD`). | neither |
+
+### victory-gpu / watched (1)
+
+| name | where read | values & default | effect (from the read-site comment) | launcher |
+|---|---|---|---|---|
+| `VICTORY_WATCHED_HEAP` | `crates/victory-gpu/src/watched.rs` `on` | true unless `0` | Whether big blocks (64 KiB or more) of host memory for the title (`XMemAllocDefault`, device heaps) are write-watched reservations (`VICTORY_WATCHED_HEAP=0`: they come from the process heap, as before 2026-11-27, and host copies of buffers there are copied whole at every refresh). | neither |
 
 ### victory-gpu / writers (6)
 

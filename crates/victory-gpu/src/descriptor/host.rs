@@ -2910,23 +2910,24 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
-            return;
-        };
-        let old = {
-            use windows::core::Interface;
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
-        };
         // A running submission may still read the old resource through
         // this slot.
-        if let Some(old) = old {
+        if let Some(old) = self.swap_kept(index, resource) {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// [`HostHeap::keep`] without the retiring: what the slot held before, if
+    /// it was another resource.
+    fn swap_kept(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
+        use windows::core::Interface;
+        let slot = self.kept.get(index as usize)?;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        // The same again: nothing to retire.
+        if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            return None;
+        }
+        std::mem::replace(&mut *slot, resource)
     }
 
     /// What slot `index` views.
@@ -3089,6 +3090,16 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        let mut let_go = Vec::new();
+        self.constant_at_into(index, buffer, gpu, size, &mut let_go);
+        crate::host::retire_resources(let_go);
+    }
+
+    /// [`HostHeap::constant_at`], with what the slot held before put into
+    /// `let_go` for the caller to retire, many at once (one lock of the
+    /// retired objects' list, which threads making thousands of slots at
+    /// once stood in line for).
+    pub(crate) fn constant_at_into(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, let_go: &mut Vec<ID3D12Resource>) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3127,7 +3138,9 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        if let Some(old) = self.swap_kept(index, holds.then(|| buffer.clone())) {
+            let_go.push(old);
+        }
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:

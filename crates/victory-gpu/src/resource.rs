@@ -938,6 +938,8 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Our own memory from a write-watched reservation (`crate::watched`).
+    watched: bool,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -1015,6 +1017,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            watched: false,
         })
     }
 
@@ -1034,8 +1037,15 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // Big ones write-watched: a host copy of a buffer placed in such a
+        // heap copies what was written since it last took it, not all of it
+        // at every refresh.
+        let watched = crate::watched::wanted(layout.size()).then(|| crate::watched::alloc(layout.size(), layout.align())).flatten();
         // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        let ptr = match watched {
+            Some(ptr) => ptr,
+            None => NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?,
+        };
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
@@ -1046,6 +1056,7 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            watched: watched.is_some(),
         })
     }
 }
@@ -1054,6 +1065,8 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            // SAFETY: from `watched::alloc` in `new`.
+            _ if self.watched => unsafe { crate::watched::free(self.ptr.as_ptr()) },
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }

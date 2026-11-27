@@ -103,8 +103,61 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+/// Whether a fill behind a copy at its place in a list ([`place`]) that reads
+/// only bytes the copy writes is done on the card from the copy's source
+/// ([`forward`]; `VICTORY_PLACED_FORWARD=0`: refused, the submission waits),
+/// and a copy at its place is in the way only of what stands behind it, as
+/// with `VICTORY_PLACED_ORDER=1` (without its cut).
+///
+/// The title copies a few hundred bytes of constants into its ring at their
+/// place in a list (a `CopyBufferRegion`), and a draw behind it in the same
+/// list reads them as a constant buffer. The ring lies in the 174 MB heap
+/// that the skinning passes declare written whole, so the draw's fill is
+/// done on the card in front of the lists: before the copy. That was refused
+/// ([`BEHIND_PLACED`]), and each refusal stood 60 to 80 ms until the flights
+/// had landed (2026-11-27: 0.09 to 0.88 refusals a frame, all of them this).
+///
+/// Why reading the copy's source is what the CPU would have read after the
+/// wait: with no flight in the air the copy is done in title memory at
+/// submission, in the order of the steps ([`place::Placed::prepare`]), and
+/// the fill reads it there: the source's bytes as they are at the copy's
+/// place among the steps. Taken here only where that holds: the fill reads
+/// nothing but bytes this copy writes; no step between them writes those
+/// bytes or the source's; no copy at its place ahead of the fill writes the
+/// source (that one would not have run yet in front of the lists); source
+/// and destination do not meet. `VICTORY_CARD_STEPS_CHECK=1` compares what
+/// each such fill was given with title memory once the submission landed.
+fn placed_forward() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PLACED_FORWARD") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FORWARD").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics, not for timed runs (`VICTORY_CARD_STEPS_CHECK=1`): the bytes
+/// each fill read through a copy at its place ([`forward`]) was given are
+/// read back and compared with title memory there when the submission has
+/// landed (where the copy's result is then, unless a later step of the same
+/// submission wrote it again).
+fn check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_CHECK").is_some_and(|v| v == "1"))
+}
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
+
+/// Why [`plan`] refuses: a copy at its place takes its source on the CPU,
+/// from title memory a flight may still write (the CPU's way waits:
+/// [`place::Waits::Yes`]), or that a copy done on the card ahead of it writes.
+const PLACED_SOURCE: &str = "a copy at its place takes its source from title memory that flights or a step on the card write";
+
+/// Why [`plan`] refuses: a step left on the CPU reads what a copy at its
+/// place ahead of it writes, and flights keep that copy out of title memory
+/// at submission (the CPU's way waits: [`place::read_by`]).
+const PLACED_READ: &str = "a step on the CPU reads what a copy at its place ahead of it writes, which is not in title memory";
 
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
@@ -132,6 +185,138 @@ pub(super) struct Writer {
     from: usize,
     to: usize,
     copy: bool,
+}
+
+/// What writers write, by pieces of title memory: in each piece between two
+/// of their ends, whether a writer without a host copy writes it, and the
+/// host copies writers write it through (none, one, or several). [`holder`]
+/// looks there instead of at every writer: the flights in the air declare
+/// hundreds of ranges, and a frame's 5,000-7,500 fills are each looked up.
+/// (`VICTORY_HOLDER_INDEX=0`: every writer for every fill, as before.)
+#[derive(Default)]
+struct ByPiece {
+    /// The pieces' starts, in order; a piece ends where the next begins.
+    starts: Vec<usize>,
+    pieces: Vec<Piece>,
+    /// Writers of no bytes, which [`meet`] still finds inside a range.
+    empty: Vec<Writer>,
+}
+
+#[derive(Clone)]
+enum Piece {
+    Nobody,
+    /// Something without a host copy writes there.
+    Bare,
+    One(Arc<Shadow>),
+    Several,
+}
+
+/// Whether the slots of fills done on the card are made on threads of their
+/// own, each thread's slots' old resources retired under one lock
+/// (`VICTORY_SLOTS_APART=0`: on the threads for the title's bytes under
+/// flights' writes, one lock each, as before). Run f1Diag1 (timeline, four
+/// frames of gameplay): the slots took 5.4 ms a frame, the helpers waiting
+/// for a landing's batch on the same threads, and some 150 times a frame
+/// each for a lock in the program's statics (taken to be the retired
+/// objects' list; the other a slot takes, the heaps' list, is read-locked).
+fn slots_apart() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SLOTS_APART") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_APART").is_none_or(|v| v != "0"))
+}
+
+fn holder_index() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HOLDER_INDEX") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLDER_INDEX").is_none_or(|v| v != "0"))
+}
+
+impl ByPiece {
+    fn new(writers: &[Writer]) -> ByPiece {
+        let mut ends: Vec<(usize, bool, usize)> = Vec::with_capacity(2 * writers.len());
+        let mut out = ByPiece::default();
+        for (k, w) in writers.iter().enumerate() {
+            if w.from < w.to {
+                ends.push((w.from, true, k));
+                ends.push((w.to, false, k));
+            } else {
+                out.empty.push(Writer { shadow: w.shadow.clone(), ..*w });
+            }
+        }
+        ends.sort_unstable_by_key(|e| e.0);
+        // Writers over the piece now: those without a host copy, and by host
+        // copy how many.
+        let mut bare = 0usize;
+        let mut by: HashMap<usize, (usize, Arc<Shadow>)> = HashMap::default();
+        let mut i = 0;
+        while i < ends.len() {
+            let at = ends[i].0;
+            while i < ends.len() && ends[i].0 == at {
+                let (_, opens, k) = ends[i];
+                match &writers[k].shadow {
+                    None if opens => bare += 1,
+                    None => bare -= 1,
+                    Some(s) => {
+                        let key = Arc::as_ptr(s) as usize;
+                        if opens {
+                            by.entry(key).or_insert_with(|| (0, s.clone())).0 += 1;
+                        } else if let Some(e) = by.get_mut(&key) {
+                            e.0 -= 1;
+                            if e.0 == 0 {
+                                by.remove(&key);
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let piece = match (bare, by.len()) {
+                (1.., _) => Piece::Bare,
+                (0, 0) => Piece::Nobody,
+                (0, 1) => Piece::One(by.values().next().map(|e| e.1.clone()).unwrap_or_else(|| unreachable!())),
+                _ => Piece::Several,
+            };
+            out.starts.push(at);
+            out.pieces.push(piece);
+        }
+        out
+    }
+
+    /// What [`holder`] finds of the writers of `[from, to)`: as there, the
+    /// host copy they all write it through if any.
+    fn of(&self, from: usize, to: usize) -> Result<Option<Arc<Shadow>>, &'static str> {
+        // The piece `from` lies in, and those after it up to `to`.
+        let first = self.starts.partition_point(|&s| s <= from).saturating_sub(1);
+        let mut found: Option<&Arc<Shadow>> = None;
+        for k in first..self.starts.len() {
+            let start = self.starts[k];
+            if start >= to {
+                break;
+            }
+            let end = self.starts.get(k + 1).copied().unwrap_or(usize::MAX);
+            if end <= from {
+                continue;
+            }
+            match (&self.pieces[k], found) {
+                (Piece::Nobody, _) => {}
+                (Piece::Bare, _) => return Err("a read-back or a value behind a flight is written there"),
+                (Piece::Several, _) => return Err("flights write it through two host copies"),
+                (Piece::One(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
+                (Piece::One(s), _) => found = Some(s),
+            }
+        }
+        let found = found.cloned();
+        written_through(&self.empty, None, from, to).and_then(|e| match (e, found) {
+            (Some(e), Some(f)) if !Arc::ptr_eq(&e, &f) => Err("flights write it through two host copies"),
+            (e, f) => Ok(f.or(e)),
+        })
+    }
 }
 
 /// What `items` of the line write.
@@ -218,8 +403,11 @@ enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
-    /// A copy that its list does on the card ([`place`]).
-    Placed { dst: usize, src: usize, len: usize },
+    /// A copy that its list does on the card ([`place`]). `cpu`: its source
+    /// is taken from title memory at submission ([`place::Placed::source_on_cpu`]),
+    /// and `src_asked` flights may write it; `free`: no flight may write its
+    /// source or destination, so title memory takes the copy at submission.
+    Placed { dst: usize, src: usize, len: usize, cpu: bool, src_asked: bool, free: bool },
     /// Anything, anywhere.
     Run,
 }
@@ -269,6 +457,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
+            Does::Placed { src_asked: true, .. } => return Err(PLACED_SOURCE),
             Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
         }
@@ -311,7 +500,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
+        if let Does::Placed { dst, src, len, .. } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
@@ -323,6 +512,27 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             if !by_order || found.is_some() {
                 return Err(BEHIND_PLACED);
             }
+        }
+    }
+    // What stays on the CPU behind a copy at its place that flights keep out
+    // of title memory would read the destination without the copy.
+    for (p, d) in does.iter().enumerate() {
+        let Does::Placed { dst, len, free: false, .. } = *d else {
+            continue;
+        };
+        let to = (dst, dst + len);
+        let reads_it = |(i, e): (usize, &Does)| {
+            !taken[i]
+                && match *e {
+                    Does::Copy { src, len: n, .. } | Does::Fill { src, len: n, .. } | Does::Placed { src, len: n, cpu: true, .. } => {
+                        meet((src, src + n), to)
+                    }
+                    Does::Read { from, to: end, .. } => meet((from, end), to),
+                    _ => false,
+                }
+        };
+        if does.iter().enumerate().skip(p + 1).any(reads_it) {
+            return Err(PLACED_READ);
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
@@ -344,6 +554,11 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             }
             Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
                 return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
+            }
+            // Its source taken from title memory at submission (into the
+            // list's upload memory, or into title memory at the destination).
+            Does::Placed { src, len, cpu, free, .. } if (cpu || free) && touched(&behind, (src, src + len)) => {
+                return Err(PLACED_SOURCE);
             }
             _ => {}
         }
@@ -379,6 +594,54 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     Ok(out)
 }
 
+/// Fills that read only bytes a copy at its place ahead of them writes, made
+/// to read the copy's source instead, and to be done on the card
+/// ([`placed_forward`] says why and when): their places, each with the
+/// address the fill read before.
+fn forward(does: &mut [Does]) -> Vec<(usize, usize)> {
+    let placed: Vec<usize> = (0..does.len()).filter(|&p| matches!(does[p], Does::Placed { .. })).collect();
+    let mut out = Vec::new();
+    if placed.is_empty() {
+        return out;
+    }
+    for i in 0..does.len() {
+        let Does::Fill { src, len, to: true, .. } = does[i] else {
+            continue;
+        };
+        let read = (src, src + len);
+        let ahead = &placed[..placed.partition_point(|&p| p < i)];
+        // The last copy at its place ahead of it that writes what it reads.
+        let Some(&p) = ahead.iter().rev().find(|&&p| matches!(does[p], Does::Placed { dst, len, .. } if meet((dst, dst + len), read)))
+        else {
+            continue;
+        };
+        let Does::Placed { dst, src: from, len: n, free: false, .. } = does[p] else {
+            // In title memory at submission: the CPU's fill reads it there.
+            continue;
+        };
+        if src < dst || src + len > dst + n || meet((from, from + n), (dst, dst + n)) {
+            continue;
+        }
+        let source = (from + (src - dst), from + (src - dst) + len);
+        // Nothing between them writes what it reads or the source; no copy at
+        // its place ahead of it writes the source (not yet done in front of
+        // the lists).
+        let between = does[p + 1..i].iter().any(|d| match *d {
+            Does::Copy { dst: w, len: l, .. } => meet((w, w + l), read) || meet((w, w + l), source),
+            Does::Placed { dst: w, len: l, .. } => meet((w, w + l), read),
+            Does::Run => true,
+            _ => false,
+        });
+        let unplaced = ahead.iter().any(|&q| matches!(does[q], Does::Placed { dst: w, len: l, .. } if meet((w, w + l), source)));
+        if between || unplaced {
+            continue;
+        }
+        does[i] = Does::Fill { src: source.0, len, asked: true, to: true };
+        out.push((i, src));
+    }
+    out
+}
+
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
 /// date in `[from, to)`.
 fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
@@ -391,17 +654,33 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
+#[cfg(test)]
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-    let mut found: Option<&Arc<Shadow>> = None;
+    holder_of(written_through(writers, None, from, to)?, from, to)
+}
+
+/// The host copy all of `writers` that write `[from, to)` write it through,
+/// if any; with `index` ([`ByPiece`]) the writers it was made of are looked
+/// up there and `writers` are those added since.
+fn written_through(writers: &[Writer], index: Option<&ByPiece>, from: usize, to: usize) -> Result<Option<Arc<Shadow>>, &'static str> {
+    let mut found: Option<Arc<Shadow>> = match index {
+        Some(index) => index.of(from, to)?,
+        None => None,
+    };
     for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-        match (&w.shadow, found) {
+        match (&w.shadow, &found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
-            (Some(s), _) => found = Some(s),
+            (Some(s), _) => found = Some(s.clone()),
         }
     }
+    Ok(found)
+}
+
+/// [`holder`], given what [`written_through`] found.
+fn holder_of(found: Option<Arc<Shadow>>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let shadow = match found {
-        Some(s) => s.clone(),
+        Some(s) => s,
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
@@ -453,7 +732,17 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                Step::Placed(p) => {
+                    let (cpu, src_asked) = (p.source_on_cpu(), touches(written, p.src, p.src + p.len));
+                    Does::Placed {
+                        dst: p.dst,
+                        src: p.src,
+                        len: p.len,
+                        cpu,
+                        src_asked: cpu && src_asked,
+                        free: !src_asked && !touches(written, p.dst, p.dst + p.len),
+                    }
+                }
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
@@ -477,7 +766,10 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (mut does, steps) = does_of(&written, runs);
+    if placed_forward() {
+        forward(&mut does);
+    }
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -526,6 +818,10 @@ struct Op {
     at: u64,
     level: u32,
     to: To,
+    /// A fill read through a copy at its place ([`forward`]): the title
+    /// address it read before, and (with [`check`]) whether a step behind it
+    /// in the submission writes those bytes again.
+    forwarded: Option<(usize, bool)>,
 }
 
 enum To {
@@ -612,8 +908,9 @@ unsafe impl Send for Own {}
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills and copies done on the card, their
-/// bytes, and submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// bytes, submissions that waited instead, refused by a check, and fills read
+/// through a copy at its place ([`forward`]).
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -622,6 +919,7 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    check: Option<Check>,
 }
 
 impl Taken {
@@ -645,6 +943,9 @@ impl Taken {
 
     /// The submission has run and landed: the list and its buffer are free.
     pub(super) fn landed(self) {
+        if let Some(check) = &self.check {
+            check.compare();
+        }
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
@@ -688,8 +989,18 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (mut does, steps) = does_of(written, runs);
+        let forwarded = if placed_forward() { forward(&mut does) } else { Vec::new() };
+        let chosen = match plan(&does, stage(), placed_order() || placed_forward(), &mut None) {
+            Ok(chosen) => chosen,
+            Err(why) => {
+                #[cfg(feature = "diagnostics")]
+                if why == BEHIND_PLACED {
+                    refused_behind(&does, &steps, &forwarded);
+                }
+                return Err(why);
+            }
+        };
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -703,6 +1014,9 @@ impl Host {
             }));
             all
         };
+        // (Looked up by piece; the copies' destinations added below one by one.)
+        let index = holder_index().then(|| ByPiece::new(&writers));
+        let base = if index.is_some() { writers.len() } else { 0 };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -725,7 +1039,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder_of(written_through(&writers[base..], index.as_ref(), src, src + len)?, src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -748,7 +1062,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = holder_of(written_through(&writers[base..], index.as_ref(), dst, dst + len)?, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -772,12 +1086,24 @@ impl Host {
                     None => continue,
                 },
             };
+            let forwarded = forwarded.binary_search_by_key(&i, |f| f.0).ok().map(|k| {
+                let at = forwarded[k].1;
+                // (Then title memory there after the landing is a later step's.)
+                let again = check()
+                    && does[i + 1..].iter().any(|d| match *d {
+                        Does::Copy { dst, len: n, .. } | Does::Placed { dst, len: n, .. } => meet((dst, dst + n), (at, at + len)),
+                        Does::Run => true,
+                        _ => false,
+                    });
+                (at, again)
+            });
             ops.push(Op {
                 from: (from, src),
                 len,
                 at,
                 level,
                 to,
+                forwarded,
             });
         }
         spent.next("steps on the card: the list");
@@ -830,6 +1156,7 @@ impl Host {
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        let check = if check() { self.check_forwarded(&own, &ops) } else { None };
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -838,7 +1165,7 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
+        let slot = |part: usize| {
             for op in &ops {
                 if let To::Slot(heap, index) = &op.to
                     && *index as usize / 4 % parts == part
@@ -847,11 +1174,38 @@ impl Host {
                     crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
                 }
             }
-        });
+        };
+        if slots_apart() {
+            let slots: Vec<(usize, u32, u64, u32)> = ops
+                .iter()
+                .filter_map(|op| match op.to {
+                    To::Slot(heap, index) => Some((heap, index, gpu + op.at, op.len as u32)),
+                    _ => None,
+                })
+                .collect();
+            crate::land::each_steps(parts, &|part| {
+                // By heap as they come (the same slot twice: the later last),
+                // what they held retired together.
+                let mut mine = slots.iter().filter(|s| s.1 as usize / 4 % parts == part).peekable();
+                while let Some(&&(heap, ..)) = mine.peek() {
+                    let mut run = Vec::new();
+                    while let Some(&&(h, index, at, len)) = mine.peek()
+                        && h == heap
+                    {
+                        run.push((index, at, len));
+                        mine.next();
+                    }
+                    crate::descriptor::constant_slots(heap, &own.between, run.into_iter());
+                }
+            });
+        } else {
+            crate::land::each_under(parts, &slot);
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[4].fetch_add(ops.iter().filter(|op| op.forwarded.is_some()).count() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
@@ -859,9 +1213,75 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            check,
         }))
     }
 
+    /// [`check`]: the bytes of the fills read through a copy at its place,
+    /// copied out of the buffer between into one we read once the submission
+    /// has landed. `own`'s list is open, its levels recorded (the buffer
+    /// between left readable by copies).
+    fn check_forwarded(&self, own: &Own, ops: &[Op]) -> Option<Check> {
+        let again = ops.iter().filter(|op| op.forwarded.is_some_and(|f| f.1)).count() as u64;
+        CHECKED.lock().unwrap_or_else(|e| e.into_inner()).3 += again;
+        let looked: Vec<&Op> = ops.iter().filter(|op| op.forwarded.is_some_and(|f| !f.1)).collect();
+        let total: u64 = looked.iter().map(|op| op.len as u64).sum();
+        if looked.is_empty() {
+            return None;
+        }
+        let buffer = self.read_back_buffer(total)?;
+        let mut places = Vec::with_capacity(looked.len());
+        let mut at = 0u64;
+        for op in looked {
+            // SAFETY: an open list; live buffers, ranges inside them; the
+            // buffer between is in a state copies read from.
+            unsafe { own.list.list.CopyBufferRegion(&buffer, at, &own.between, op.at, op.len as u64) };
+            places.push((at as usize, op.forwarded.map_or(0, |f| f.0), op.len, op.from.1));
+            at += op.len as u64;
+        }
+        Some(Check { buffer, places })
+    }
+}
+
+/// What [`check`] reads back of a submission: the buffer, and per fill its
+/// place in it, the title address it read before, bytes, and the source it
+/// was read through.
+struct Check {
+    buffer: ID3D12Resource,
+    places: Vec<(usize, usize, usize, usize)>,
+}
+
+/// [`check`] since the last frame-rate line: fills compared, those that
+/// differed, the last that did (title address, source, bytes), and those not
+/// compared because a later step of their submission writes their bytes.
+static CHECKED: Mutex<(u64, u64, Option<(usize, usize, usize)>, u64)> = Mutex::new((0, 0, None, 0));
+
+impl Check {
+    /// The submission has landed: title memory holds what the card made of
+    /// the copy at its place (and of anything behind it there).
+    fn compare(&self) {
+        let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the card has finished writing.
+        if unsafe { self.buffer.Map(0, None, Some(&raw mut data)) }.is_err() || data.is_null() {
+            return;
+        }
+        let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+        for &(at, title, len, source) in &self.places {
+            // SAFETY: inside the mapping (the places were laid out in it).
+            let given = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(at), len) };
+            let mut there = vec![0u8; len];
+            checked.0 += 1;
+            if !read_into(title as *const u8, &mut there) || there != given {
+                checked.1 += 1;
+                checked.2 = Some((title, source, len));
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { self.buffer.Unmap(0, None) };
+    }
+}
+
+impl Host {
     /// A list of ours open for recording, and its buffer.
     fn own_list(&self) -> Option<Own> {
         let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -898,6 +1318,50 @@ fn noted(ops: &[Op]) {
     }
 }
 
+/// Diagnostics: refusals for [`BEHIND_PLACED`] since the last frame-rate
+/// line, by what stands in the copy's way: how often, and the last pair.
+#[cfg(feature = "diagnostics")]
+static BEHIND: Mutex<Option<std::collections::BTreeMap<String, (u64, String)>>> = Mutex::new(None);
+
+/// Diagnostics: [`plan`] refused `does` for [`BEHIND_PLACED`]: which copy at
+/// its place and which step in its way.
+#[cfg(feature = "diagnostics")]
+fn refused_behind(does: &[Does], steps: &[(usize, usize)], forwarded: &[(usize, usize)]) {
+    let mut found = None;
+    let _ = plan(does, stage(), true, &mut found);
+    let key = match found {
+        None => "in the way ahead of it (no step behind it)".to_string(),
+        Some((p, i)) => {
+            let (Does::Placed { dst, len, free, .. }, d) = (does[p], does[i]) else {
+                return;
+            };
+            let kind = match d {
+                Does::Fill { src, len: n, .. } if src >= dst && src + n <= dst + len => "a fill of bytes it alone writes",
+                Does::Fill { .. } => "a fill of bytes it partly writes",
+                Does::Copy { .. } => "a buffer copy",
+                _ => "another step",
+            };
+            format!(
+                "{kind}, {} list, {} (the copy free: {free})",
+                if steps[p].0 == steps[i].0 { "same" } else { "a later" },
+                if forwarded.iter().any(|f| f.0 == i) { "read through it" } else { "read as it was" },
+            )
+        }
+    };
+    let last = found.map_or_else(String::new, |(p, i)| format!("{:x?} / {:x?} ({} fills read through copies)", does[p], does[i], forwarded.len()));
+    let mut all = BEHIND.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all.get_or_insert_with(Default::default).entry(key).or_default();
+    *e = (e.0 + 1, last);
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_behind(frames: f64) {
+    let all = BEHIND.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    for (key, (n, last)) in all {
+        tracing::info!("refused for a copy at its place, per frame: {:.2} for {key}; the last: {last}", n as f64 / frames);
+    }
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
@@ -906,13 +1370,29 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read through a copy at its place \
+         (VICTORY_PLACED_FORWARD={})",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        d[4],
+        u8::from(placed_forward()),
     );
+    if check() {
+        let (n, wrong, last, again) = std::mem::take(&mut *CHECKED.lock().unwrap_or_else(|e| e.into_inner()));
+        let last = last.map_or_else(String::new, |(title, source, len)| {
+            format!(" (the last: {len:#x} bytes at {title:#x}, read through {source:#x})")
+        });
+        if wrong > 0 {
+            tracing::warn!("card steps check (VICTORY_CARD_STEPS_CHECK): {wrong} of {n} fills read through a copy at its place differ from title memory after the landing{last}; {again} not compared, written again later in their submission");
+        } else {
+            tracing::info!("card steps check (VICTORY_CARD_STEPS_CHECK): {n} fills read through a copy at its place, all as title memory after the landing; {again} not compared, written again later in their submission");
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    log_behind(frames);
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1020,9 +1500,171 @@ mod tests {
 
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
+    /// A copy at its place that flights keep out of title memory.
+    fn placed(dst: usize, src: usize, len: usize) -> Does {
+        Does::Placed { dst, src, len, cpu: false, src_asked: false, free: false }
+    }
+
+    /// `plan` after `forward`, as stage 2 does them by default: what is done
+    /// on the card, and the fills read through a copy.
+    fn forwarded(does: &[Does]) -> (Result<Vec<(usize, u32)>, &'static str>, Vec<usize>) {
+        let mut does = does.to_vec();
+        let through = forward(&mut does).into_iter().map(|f| f.0).collect();
+        (plan(&does, 2, true, &mut None), through)
+    }
+
+    /// A fill behind a copy at its place that reads only what the copy
+    /// writes reads the copy's source; any other is in its way as before.
+    #[test]
+    fn fills_behind_a_copy_at_its_place_read_its_source() {
+        let p = placed(2000, 3000, 64);
+        assert_eq!(forwarded(&[p, fill(2016, 32, true)]), (Ok(vec![(1, 0)]), vec![1]));
+        let mut does = [p, fill(2016, 32, true)];
+        forward(&mut does);
+        assert_eq!(does[1], Does::Fill { src: 3016, len: 32, asked: true, to: true });
+        // A fill the CPU would do, behind it: read through it too.
+        assert_eq!(forwarded(&[p, fill(2000, 64, false)]), (Ok(vec![(1, 0)]), vec![1]));
+        // Ahead of it: as it was.
+        assert_eq!(forwarded(&[fill(2016, 32, true), p]), (Ok(vec![(0, 0)]), vec![]));
+        // Partly what it writes; something between that writes what is read
+        // or the source; a copy at its place ahead that writes the source;
+        // a source that meets the destination: refused as before.
+        for does in [
+            vec![p, fill(2032, 64, true)],
+            vec![p, copy(2020, 9000, 4, false), fill(2016, 32, true)],
+            vec![p, copy(3020, 9000, 4, false), fill(2016, 32, true)],
+            vec![p, placed(2020, 9000, 4), fill(2016, 32, true)],
+            vec![placed(3000, 7000, 64), p, fill(2016, 32, true)],
+            vec![placed(2000, 2010, 64), fill(2016, 32, true)],
+        ] {
+            let (planned, through) = forwarded(&does);
+            assert!(planned.is_err() && through.is_empty(), "{does:?}: {planned:?} {through:?}");
+        }
+        // A copy that title memory takes at submission: the CPU's fill reads
+        // it there.
+        let free = Does::Placed { dst: 2000, src: 3000, len: 64, cpu: false, src_asked: false, free: true };
+        assert_eq!(forwarded(&[free, fill(2016, 32, false)]), (Ok(vec![]), vec![]));
+        // Without forwarding it is refused.
+        assert_eq!(plan(&[p, fill(2016, 32, true)], 2, true, &mut None), Err(BEHIND_PLACED));
+    }
+
+    /// What the CPU's way would wait for at a copy at its place is refused.
+    #[test]
+    fn what_a_copy_at_its_place_waits_for_is_refused() {
+        // Its source taken on the CPU while flights may write it.
+        let cpu = Does::Placed { dst: 2000, src: 3000, len: 64, cpu: true, src_asked: true, free: false };
+        assert_eq!(plan(&[fill(9000, 8, true), cpu], 2, true, &mut None), Err(PLACED_SOURCE));
+        // ... or behind a copy done on the card that writes it: also when
+        // title memory takes the copy at submission.
+        for p in [Does::Placed { dst: 2000, src: 3000, len: 64, cpu: true, src_asked: false, free: false }, Does::Placed { dst: 2000, src: 3000, len: 64, cpu: false, src_asked: false, free: true }] {
+            assert_eq!(plan(&[copy(3010, 9000, 8, true), p], 2, true, &mut None), Err(PLACED_SOURCE));
+            // (Behind it, it is in the copy's way.)
+            assert_eq!(plan(&[p, copy(3010, 9000, 8, true)], 2, true, &mut None), Err(BEHIND_PLACED));
+            assert_eq!(plan(&[p, copy(5010, 9000, 8, true)], 2, true, &mut None), Ok(vec![(1, 0)]));
+        }
+        // A read on the CPU of its destination behind it, not ahead of it.
+        let p = placed(2000, 3000, 64);
+        let read = Does::Read { from: 2010, to: 2020, asked: false };
+        assert_eq!(plan(&[p, fill(9000, 8, true), read], 2, true, &mut None), Err(PLACED_READ));
+        assert_eq!(plan(&[p, fill(9000, 8, true), stuck(2010, 4)], 2, true, &mut None), Err(PLACED_READ));
+        assert_eq!(plan(&[read, p, fill(9000, 8, true)], 2, true, &mut None), Ok(vec![(2, 0)]));
+        assert_eq!(plan(&[Does::Placed { dst: 2000, src: 3000, len: 64, cpu: false, src_asked: false, free: true }, fill(9000, 8, true), read], 2, true, &mut None), Ok(vec![(1, 0)]));
+    }
+
+    /// With copies at their place among the steps: whatever is done, what
+    /// every step reads is what it reads one after the other, the copies at
+    /// their place done there and not in title memory, and memory ends the
+    /// same.
+    #[test]
+    fn copies_at_their_place_leave_what_the_order_does() {
+        let mut seed = 777u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut done, mut through) = (0, 0);
+        for _ in 0..20000 {
+            let does: Vec<Does> = (0..2 + random(8))
+                .map(|_| {
+                    let (at, other, len) = (random(60) as usize, random(60) as usize, 1 + random(8) as usize);
+                    match random(9) {
+                        0..2 => copy(at, other, len, random(4) == 0),
+                        2..5 => fill(at, len, random(3) == 0),
+                        5 => stuck(at, len),
+                        6 => Does::Read { from: at, to: at + len, asked: false },
+                        _ => placed(at, other, len),
+                    }
+                })
+                .collect();
+            let mut changed = does.clone();
+            let forwarded: Vec<usize> = forward(&mut changed).into_iter().map(|f| f.0).collect();
+            let Ok(chosen) = plan(&changed, 2, true, &mut None) else {
+                continue;
+            };
+            let taken = |i: usize| chosen.iter().any(|c| c.0 == i);
+            // (A copy on the CPU over a copy at its place's bytes is out of
+            // order without flights too: `upcheck::order`.)
+            let crossed = does.iter().enumerate().any(|(i, d)| {
+                matches!(*d, Does::Copy { dst, len, .. } if !taken(i) && does.iter().any(|e| matches!(*e,
+                    Does::Placed { dst: w, src, len: n, .. } if meet((dst, dst + len), (w, w + n)) || meet((dst, dst + len), (src, src + n)))))
+            });
+            if crossed {
+                continue;
+            }
+            done += 1;
+            through += forwarded.iter().filter(|i| taken(**i)).count();
+            let reads = |d: &Does| match *d {
+                Does::Read { from, to, .. } => Some((from, to)),
+                Does::Placed { src, len, .. } => Some((src, src + len)),
+                _ => reads_writes(d).map(|r| r.0),
+            };
+            let start: Vec<u32> = (0..80).collect();
+            // One after the other.
+            let mut memory = start.clone();
+            let mut wanted = Vec::new();
+            for d in &does {
+                wanted.push(reads(d).map(|(a, b)| memory[a..b].to_vec()));
+                if let Does::Copy { dst, src, len, .. } | Does::Placed { dst, src, len, .. } = *d {
+                    memory.copy_within(src..src + len, dst);
+                }
+            }
+            // The CPU's steps in title memory (no copy at its place there).
+            let mut cpu = start.clone();
+            for (i, d) in does.iter().enumerate().filter(|&(i, d)| !taken(i) && !matches!(d, Does::Placed { .. })) {
+                if let Some((a, b)) = reads(d) {
+                    assert_eq!(cpu[a..b], wanted[i].as_ref().unwrap()[..], "step {i} of {does:?}: {chosen:?}");
+                }
+                if let Does::Copy { dst, src, len, .. } = *d {
+                    cpu.copy_within(src..src + len, dst);
+                }
+            }
+            // The card's: in front of the lists, then the copies at their
+            // place in the lists.
+            let mut card = cpu.clone();
+            for level in 0..=chosen.iter().map(|c| c.1).max().unwrap_or(0) {
+                let before = card.clone();
+                for &(i, _) in chosen.iter().filter(|c| c.1 == level) {
+                    let ((from, to), (dst, _)) = reads_writes(&changed[i]).unwrap();
+                    assert_eq!(before[from..to], wanted[i].as_ref().unwrap()[..], "step {i} of {does:?}: {chosen:?} {forwarded:?}");
+                    if matches!(changed[i], Does::Copy { .. }) {
+                        card[dst..dst + to - from].copy_from_slice(&before[from..to]);
+                    }
+                }
+            }
+            for (i, d) in does.iter().enumerate() {
+                if let Does::Placed { dst, src, len, .. } = *d {
+                    assert_eq!(card[src..src + len], wanted[i].as_ref().unwrap()[..], "step {i} of {does:?}: {chosen:?}");
+                    card.copy_within(src..src + len, dst);
+                }
+            }
+            assert_eq!(card, memory, "{does:?}: {chosen:?}");
+        }
+        assert!(done > 2000 && through > 100, "{done} {through}");
+    }
+
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let placed = placed(2000, 3000, 64);
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);
@@ -1145,6 +1787,55 @@ mod tests {
         assert!(!elsewhere(&does, 8, 200, 300));
     }
 
+    /// Looked up by piece, the writers of a range say what they say looked
+    /// at one by one, with writers added after the pieces were made too.
+    #[test]
+    fn writers_by_piece_say_what_writers_say() {
+        let mut memory = vec![0u8; 64];
+        let copies: Vec<Arc<Shadow>> = (0..3).map(|k| Shadow::unbacked(k * 64, memory.as_mut_ptr(), 64, false)).collect();
+        let mut seed = 4242u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut ok, mut err) = (0, 0);
+        for _ in 0..3000 {
+            let writers: Vec<Writer> = (0..random(12))
+                .map(|_| {
+                    let from = random(200) as usize;
+                    let to = from + random(40) as usize;
+                    let shadow = match random(7) {
+                        0 => None,
+                        k => Some(copies[k as usize % 3].clone()),
+                    };
+                    Writer { shadow, from, to, copy: false }
+                })
+                .collect();
+            let cut = random(writers.len() as u32 + 1) as usize;
+            let index = ByPiece::new(&writers[..cut]);
+            for _ in 0..20 {
+                let from = random(220) as usize;
+                let to = from + 1 + random(30) as usize;
+                let one = written_through(&writers, None, from, to);
+                let two = written_through(&writers[cut..], Some(&index), from, to);
+                match (&one, &two) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.as_ref().map(Arc::as_ptr), b.as_ref().map(Arc::as_ptr));
+                        ok += 1;
+                    }
+                    (Err(_), Err(_)) => err += 1,
+                    _ => panic!(
+                        "{from}..{to}: {:?} {:?} ({cut} indexed): {:?}",
+                        one.map(|s| s.map(|s| Arc::as_ptr(&s))),
+                        two.map(|s| s.map(|s| Arc::as_ptr(&s))),
+                        writers.iter().map(|w| (w.from, w.to, w.shadow.as_ref().map(Arc::as_ptr))).collect::<Vec<_>>()
+                    ),
+                }
+            }
+        }
+        assert!(ok > 10_000 && err > 5_000, "{ok} {err}");
+    }
+
     /// A value written behind a flight, or a read-back, is in no host copy
     /// before it lands.
     #[test]
@@ -1208,6 +1899,36 @@ mod tests {
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();
+    }
+
+    /// What a frame's fills done on the card cost the card (ignored: a
+    /// measurement): 6,000 copies of 480 bytes as [`record`] makes them, run
+    /// and waited for, against an empty list, wall-clock medians of 15.
+    #[test]
+    #[ignore = "a measurement"]
+    fn fills_on_the_card_cost() {
+        let Some(host) = host() else {
+            return;
+        };
+        let source = host.uav_buffer(16 << 20).unwrap();
+        let time = |n: usize| {
+            let mut took = Vec::new();
+            for _ in 0..15 {
+                let own = host.own_list().unwrap();
+                let reads: Vec<(&ID3D12Resource, u64, u64, u64)> =
+                    (0..n as u64).map(|i| (&source, i * 2720 % (16 << 20), i * 512 % BETWEEN, 480)).collect();
+                record(true, &own.list.list, &own.between, &reads, &[]);
+                own.list.close();
+                let started = std::time::Instant::now();
+                host.execute(&[&own.list]);
+                took.push(started.elapsed().as_secs_f64() * 1e3);
+                POOL.lock().unwrap().push(own);
+            }
+            took.sort_by(f64::total_cmp);
+            took[took.len() / 2]
+        };
+        let (none, some) = (time(0), time(6000));
+        eprintln!("6,000 fills on the card: {some:.2} ms run and waited for, an empty list {none:.2} ms");
     }
 
     /// The whole way, in a process of its own with the relay on:
