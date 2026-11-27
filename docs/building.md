@@ -162,6 +162,11 @@ cargo fmt --all -- --check       # not in CI (see below)
   `--features diagnostics`); `cargo test -p victory-gpu --features
   diagnostics --locked --lib writers::` passes; policy passes (270 files).
   The full workspace run was not repeated.
+- **2026-11-27 (the compact texture pool, see `docs/findings.md`):** both
+  clippy commands pass; `cargo test -p victory-gpu --locked` 369 passed, 34
+  ignored; policy passes (270 files). The full workspace run was not
+  repeated. `pool.rs`, `resource.rs`, `texture.rs` and `host.rs` were not
+  rustfmt-clean before and were not reformatted.
 
 How it got there, from a tree where `f4b48ad` itself fails CI (37 / 36
 clippy lints; 2 failing `victory-gpu` tests):

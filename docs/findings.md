@@ -177,3 +177,95 @@ longer left out. Accepted on this evidence without a further proof batch.
 The mechanism is not shown (inferred: what the left-out programs write each
 frame is never written and holds whatever that memory held at the start).
 Measured on the RTX 3080 10 GB machine (Ryzen 9 5900X, 32 GB, release build, stock launcher) in the prologue's opening scene: 100 to 108 ms a frame (9 to 10 fps) with ray tracing on, of which some 66 ms is preparing on the CPU and 14 to 17 ms on the card, against 67 to 70 ms (14 to 15 fps) with it off: about a third of the frame rate. The card held about 8.5 GB of a 9.0 GB budget and the process about 20 GB. In the playable open world the frame rate was 8 to 12 fps as seen in play (not taken from the log). Long sessions were not measured; one launch ended with the PC's memory 98 % in use.
+
+## 2026-11-27: the texture pool kept a 10 GB card over its budget
+
+RTX 3080 10 GB (DXGI budget 8.7-9.0 GB), Ryzen 9 5900X, 32 GB, Series S profile, stock
+launcher with ray tracing on, release build. Unattended launches of 330 s (the world's
+first frame at 67-80 s): the cinematic is 5-70 s after that frame, idle gameplay
+70-250 s. Medians of the 5-second log lines; one launch per row, so read single-launch
+differences in fps and in the cinematic's queue as noise. Before and after are the same
+executable, before with `VICTORY_POOL_COMPACT=0`; the card's use, the pool and the
+texture counts come from the new pool line (`texture pool: ...`), the queue from
+`textures picked by index, the queue`, waits from `new memory waited for`, RAM from the
+launch script's samples of the process.
+
+**What was wrong.** With the old pool (64 MiB blocks cut first-fit, a block given back
+only when wholly empty) the world's load filled 71-78 blocks, 4.5-5.0 GB, and then let
+two thirds of its textures go; those that stayed were in nearly every block, and are
+held by descriptor slots, which the sweep cannot let go. For the rest of the launch the
+blocks held 4,544-4,992 MB for 1,866-2,307 MB of textures, and the card stood at
+100-102 % of its budget. The room rule counted all of that free space as room, but the
+textures the queue makes are mostly levels on demand, which take tiles of their own
+and cannot use it, so "room" was an illusion that alternated with a 3 GiB reserve for
+render targets that were 1.36 GB. (Raising the room share alone made it worse: 9,576 MB
+in use.)
+
+**What changed** (cards whose budget is 12 GiB or less; `VICTORY_POOL_COMPACT`): blocks
+of 16 MiB, cut from the fullest block with room; a new block only while all blocks stay
+within a quarter of the budget and within what textures hold plus a sixteenth; past
+that a texture gets an allocation of its own (exactly what the pool off does, and given
+back exactly when it goes); empty blocks kept come to a thirty-second of the budget;
+the room rule counts free pool space only up to that sixteenth, the floor is a sixth of
+the budget, and once the world's render targets are made (they rose by 512 MiB within
+20 s) only 512 MiB is kept for more of them; the sweep, when it must let go, first lets
+go of textures whose going gives memory back. Larger cards are unchanged.
+
+| launch | window | fps | ms/frame | card in use / budget MB | pool blocks / held MB | room yes | due / oldest (frames) / waiting | MakeResident in window: calls / waited / longest | "no card copy" lines | private / free RAM MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before 1 | cinematic | 5.4 | 184 | 8,897 / 9,046 (98 %) | 4,544 / 1,958 | 1/11 | 956 / 79 / 5,808 | 13,000 / 10.3 s / 388 ms | 66 | 26,157 / 501 |
+| before 1 | gameplay | 10.4 | 96 | 9,176 / 9,046 (101.5 %) | 4,544 / 1,866 | 0/31 | 452 / 8 / 266 | 14,000 / 5.9 s | 0 | 26,018 / 1,616 |
+| before 2 | cinematic | 5.0 | 201 | 8,956 / 8,945 (100 %) | 4,992 / 2,307 | 2/11 | 11,266 / 371 / 7,639 | 11,000 / 12.0 s / 807 ms | 75 | 26,590 / 667 |
+| before 2 | gameplay | 11.5 | 87 | 9,182 / 8,956 (102.4 %) | 4,992 / 2,227 | 2/30 | 163 / 8 / 81 | 14,000 / 5.9 s | 0 | 26,742 / 1,521 |
+| before 3 | cinematic | 3.6 | 282 | 8,730 / 9,020 (97 %) | 4,672 / 2,205 | 2/11 | 1,559 / 616 / 4,052 | 9,000 / 7.3 s / 938 ms | 28 | 23,516 / 946 |
+| before 3 | gameplay | 9.7 | 104 | 8,980 / 8,964 (100.1 %) | 4,672 / 2,075 | 0/29 | 160 / 8 / 170 | 13,000 / 7.9 s | 2 | 25,709 / 1,152 |
+| after 1 | cinematic | 4.3 | 230 | 7,564 / 8,751 (87.6 %) | 2,304 / 2,028 | 4/11 | 3,042 / 208 / 7,499 | 12,000 / 10.8 s / 451 ms | 0 | 23,764 / 2,238 |
+| after 1 | gameplay | 11.1 | 90 | 7,769 / 8,724 (89.1 %) | 2,304 / 1,894 | 1/30 | 72 / 8 / 110 | 15,000 / 10.5 s | 0 | 24,246 / 2,281 |
+| after 2 | cinematic | 2.8 | 352 | 7,708 / 8,728 (88.4 %) | 2,320 / 1,982 | 4/11 | 6,953 / 24 / 8,335 | 9,000 / 21.2 s / 813 ms | 0 | 24,892 / 836 |
+| after 2 | gameplay | 11.4 | 88 | 7,764 / 8,787 (88.3 %) | 2,320 / 1,996 | 1/30 | 314 / 8 / 86 | 15,000 / 9.5 s | 0 | 24,922 / 2,161 |
+| after 3 | cinematic | 4.2 | 239 | 7,907 / 8,752 (90.3 %) | 2,320 / 1,929 | 0/11 | 2,256 / 400 / 9,074 | 11,000 / 10.1 s / 496 ms | 0 | 25,097 / 970 |
+| after 3 | gameplay | 13.1 | 76 | 7,788 / 8,729 (89.2 %) | 2,320 / 1,932 | 1/30 | 366 / 8 / 40 | 15,000 / 6.5 s | 0 | 24,386 / 3,476 |
+
+("After 2" had another, small `victory.exe` of another session beside it from 85 s
+into the world; its budget and RAM were not touched. A launch that had a second game
+beside it, and the launches before the fix below, are left out.)
+
+In short: the card went from 100-102 % of its budget in gameplay to 88-89 %, the most
+seen 91.7 % (before: up to 103.7 %); the blocks from 4.5-5.0 GB to 2.3 GB, 82-86 % of
+them held; more of the title's textures had a host copy (2.4-2.5 GB against 1.9-2.2 GB
+at the end); no buffer was refused a card copy (28-75 such lines in the cinematic
+before); the process took about 1.5 GB less private memory and the PC had about 1 GB
+more free in gameplay. Gameplay fps: 9.7-11.5 before, 11.1-13.1 after. The cinematic
+is noisy both ways (2.8-5.4 fps; its queue between 956 and 11,266 slots due in either
+case) and shows no clear change. What got worse: `MakeResident` calls, because 10,000
+to 11,700 textures a launch past the pool's line have memory of their own: in gameplay
+6.5-10.5 s waited in 180 s against 5.9-7.9 s, the longest wait 451-813 ms against
+388-938 ms. The room rule now says no in gameplay because the card is at its line
+(90 % less 512 MB kept for targets), not because of reserves that never fill: the
+queue there had 40-110 slots waiting against 81-266.
+
+Measured and rejected on the way: the cap at a third of the budget instead of a
+quarter (2,880 MB). The load then filled 3,072 MB of blocks, two thirds of its
+textures went, the blocks stayed at 3,072 MB for 1,136 MB of textures (those left are
+held by slots and the sweep cannot let them go), the card sat at 94 % and no texture
+was made for the rest of the launch. The quarter is what bounds the load's leftovers.
+
+A fault found on the way: the aliasing barrier before a texture's first upload was put
+on textures with memory of their own too, which the host refuses; with the compact pool
+those are common and both first launches ended in the load (`docs/bug-journal.md`,
+2026-11-27).
+
+Device losses: none. Besides the three launches above (330 s each), five launches of
+200 s with the same build (the world at 75-81 s, so the cinematic and the start of
+gameplay) had no `removed`, `DXGI_ERROR`, `0x887a...` error, "device lost", "host GPU
+failure" or list that did not close (one launch matched `0x887a` only in a page address
+of an info line). In them the card stood at 86.8-87.9 % (the most 91 %), the blocks at
+2,224-2,320 MB for 1,762-2,057 MB of textures. Why this does not undo what the pool's
+rules guard against (runs n08, n11, n15: a texture shown in memory just made):
+textures that go past the pool's line take the path the pool off takes, which made
+every texture in its 240 s launch without a loss: memory made not resident, then
+`MakeResident` and the mapping waited for (`VICTORY_WAIT_RESIDENT`), and slots that
+show it only after its upload has run (`VICTORY_SHOW_AFTER`); pieces still come from
+ripe blocks, a piece still rests 2.5 s, a block is still let go only when wholly empty,
+and objects are still dropped `bury_lag` submissions late. What changed is which ripe
+block a piece is cut from, the block size, and when a texture is made at all.

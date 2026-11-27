@@ -1657,11 +1657,15 @@ pub(crate) fn host_made<'a>(
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
 /// reported budget so 4–6 GiB cards do not bypass the budget check early.
+/// `compact` (a budget of 12 GiB or less, `crate::pool::compact`): a sixth
+/// of it, 1,497 MB of 8,980, under what such copies come to in the world
+/// there (about 2,000 MB with their tiles), so that the budget, not the
+/// floor, says when there is no more room.
 #[cfg(any(windows, test))]
-fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
+fn texture_floor_bytes(vram_budget: Option<u64>, compact: bool) -> u64 {
     const MAX_FLOOR: u64 = 2 << 30;
     match vram_budget {
-        Some(budget) => MAX_FLOOR.min(budget / 4),
+        Some(budget) => MAX_FLOOR.min(budget / if compact { 6 } else { 4 }),
         None => MAX_FLOOR,
     }
 }
@@ -1688,7 +1692,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
+    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget), crate::pool::compact());
     if filled < floor {
         return true;
     }
@@ -1722,6 +1726,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+///
+/// On a card of 12 GiB or less (`crate::pool::compact`) that much is kept
+/// only until the world's first frames have made them ([`note_targets`]:
+/// they rose by [`TARGETS_RISE`] within 20 s), and from then on
+/// [`TARGETS_MARGIN`] at most: on an RTX 3080 (budget 8,980 MB, Series S
+/// profile) they were 234 MB in the menus, 386 MB while the world loaded,
+/// 1,003 MB 3 s into it and 1,360 MB from a minute on, so that 1.7 GB were
+/// kept for the rest of the session for targets that never came.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1732,9 +1744,79 @@ pub(crate) fn targets_room_kept() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
-    // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_kept(most, host_written(), TARGETS_ROSE.load(Relaxed) && crate::pool::compact())
+}
+
+/// Every host texture's bytes less those of the copies the title fills:
+/// render targets and the other host copies the host writes.
+#[cfg(windows)]
+fn host_written() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
+}
+
+/// What [`targets_room_kept`] keeps of `most` with `targets` bytes of them
+/// made: what is left of it, and after the world's first frames made them
+/// (`rose`) not more than [`TARGETS_MARGIN`].
+#[cfg(any(windows, test))]
+fn targets_kept(most: u64, targets: u64, rose: bool) -> u64 {
+    let left = most.saturating_sub(targets);
+    if rose { left.min(TARGETS_MARGIN) } else { left }
+}
+
+/// How much the bytes of render targets rise within 20 s when a world's
+/// first frames make them (617 MB in 3 s on the RTX 3080 above, 1,600 MB
+/// on the RX 7900 XTX of runs 193-198); nothing between the menus and the
+/// world rose so much on either ([`rose`]).
+#[cfg(any(windows, test))]
+const TARGETS_RISE: u64 = 512 << 20;
+
+/// The room kept for render targets after that: more than they grew by
+/// in the minute after their rise (357 MB on the RTX 3080).
+#[cfg(any(windows, test))]
+const TARGETS_MARGIN: u64 = 512 << 20;
+
+/// The world's first frames made their render targets ([`note_targets`]).
+#[cfg(windows)]
+static TARGETS_ROSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Once a second (`host::sweep`): the bytes of render targets, the last 20
+/// of them, for [`targets_room_kept`].
+#[cfg(windows)]
+pub(crate) fn note_targets() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SEEN: std::sync::Mutex<std::collections::VecDeque<u64>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    if TARGETS_ROSE.load(Relaxed) || !crate::pool::compact() {
+        return;
+    }
+    let targets = host_written();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() == 20 {
+        seen.pop_front();
+    }
+    seen.push_back(targets);
+    if rose(seen.iter().copied()) {
+        TARGETS_ROSE.store(true, Relaxed);
+        tracing::info!(
+            targets_mb = targets >> 20,
+            "the world's render targets are made: room kept for more of them is {} MB from now on where the card has 12 GiB or less",
+            TARGETS_MARGIN >> 20
+        );
+    }
+}
+
+/// Whether bytes of render targets seen in order rose by [`TARGETS_RISE`]
+/// from the lowest of them, that lowest being 64 MiB or more: not the
+/// targets the title makes first, from none, before its menus (652 MB of
+/// them on the RX 7900 XTX, 234 MB on the RTX 3080).
+#[cfg(any(windows, test))]
+fn rose(seen: impl Iterator<Item = u64>) -> bool {
+    const FIRST: u64 = 64 << 20;
+    let mut low = u64::MAX;
+    seen.into_iter().any(|bytes| {
+        low = low.min(bytes);
+        low >= FIRST && bytes >= low.saturating_add(TARGETS_RISE)
+    })
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2079,7 +2161,21 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    // On a card of 12 GiB or less, with a limit: first those whose going
+    // gives the card memory back (with memory of their own, or in a block
+    // that holds half of itself or less: `crate::pool::sparse`), the longest
+    // idle first; then the others. Letting go of one in a full block only
+    // made a hole there: after the world's load the card's memory in use
+    // stayed where it was while the sweep let thousands go.
+    let giving_first = most != u64::MAX && crate::pool::compact();
+    let gives_back = |host: &HostTexture| crate::pool::sparse(&host.texture).unwrap_or(host.tiled.is_none());
+    for (at, giving) in all
+        .range(from..)
+        .take(part)
+        .map(|&at| (at, false))
+        .chain(by_age.iter().filter(|_| giving_first).map(|&(_, at)| (at, true)))
+        .chain(by_age.iter().map(|&(_, at)| (at, false)))
+    {
         if bytes >= most {
             break;
         }
@@ -2101,6 +2197,7 @@ pub(crate) fn let_go_idle() {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
+                    && (!giving || gives_back(host))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -4580,13 +4677,39 @@ float4 lit() : SV_Target { return 1.0; }
     #[test]
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
-        assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(None, false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(4 * GIB), false), GIB);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB), false), 6 * GIB / 4);
+        assert_eq!(texture_floor_bytes(Some(8 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(24 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(32 * GIB), false), 2 * GIB);
+        // Cards of 12 GiB or less: a sixth.
+        assert_eq!(texture_floor_bytes(None, true), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(9 * GIB), true), 9 * GIB / 6);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB), true), 2 * GIB);
+    }
+
+    #[test]
+    fn room_for_targets_is_kept_until_the_world_has_made_them() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // Before: what is left of the most; after: the margin at most.
+        assert_eq!(targets_kept(most, 386 * MIB, false), 2686 * MIB);
+        assert_eq!(targets_kept(most, 1360 * MIB, false), 1712 * MIB);
+        assert_eq!(targets_kept(most, 1360 * MIB, true), TARGETS_MARGIN);
+        assert_eq!(targets_kept(most, 2900 * MIB, true), 172 * MIB);
+        assert_eq!(targets_kept(0, 1360 * MIB, true), 0);
+        // The RTX 3080's seconds: menus, the load, the world's first frames.
+        let seen = |mb: &[u64]| rose(mb.iter().map(|mb| mb * MIB));
+        assert!(!seen(&[234, 234, 383, 386, 386]));
+        assert!(seen(&[234, 383, 386, 386, 1003]));
+        // Not the first targets, made from none before the menus.
+        assert!(!seen(&[0, 20, 652, 652]));
+        assert!(!seen(&[0, 652, 652, 2255]));
+        assert!(seen(&[652, 652, 2255]));
+        // Slow growth within 20 s is no rise.
+        assert!(!seen(&[1003, 1095, 1110, 1188, 1215, 1265, 1356]));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
