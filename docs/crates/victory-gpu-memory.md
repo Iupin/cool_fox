@@ -144,6 +144,11 @@ return or make a copy. A 1024-entry hash cache sits in front of them (`FOUND`,
   `aliased`, and `opened` (rest timestamps).
 - Lock-free bitmaps `PUBLISHED`, `PROTECTED` and `BESIDE` (`watch.rs:951-969`),
   read by the fault handler without the lock.
+- Diagnostics builds time how long `GUARDS` is held, by the line that took
+  it (`guards()` and `guards_timed()` are `#[track_caller]` there and hand
+  out `held::Held`, which counts on drop): the copystat line `waits for the
+  write trackers' locks` ends with `the guards held by: watch.rs:<line> Nx
+  T ms (longest L)`, the eight busiest.
 - `MAPPING: RwLock<()>` (`watch.rs:2243`): held shared by in-place reads of title
   memory (`title_memory_reading`) and exclusive by the runtime while it remaps
   (`title_memory_remapping`). Without it, a page went away between "is it
